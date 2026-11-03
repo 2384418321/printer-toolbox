@@ -1,0 +1,21 @@
+# 编译产物与本地生成文件
+dist/
+bin/
+obj/
+*.exe
+*.pdb
+*.dll
+
+# 诊断程序运行时输出
+tools/bin/
+*.dump.txt
+
+# Visual Studio / Rider 用户文件
+.vs/
+.idea/
+*.user
+*.suo
+
+# Windows 缩略图缓存
+Thumbs.db
+desktop.ini
