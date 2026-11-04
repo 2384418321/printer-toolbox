@@ -39,7 +39,7 @@ $csc = 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 ## 运行
 
 ```powershell
-.\tools\bin\MatchProbe.exe 192.168.1.100 192.168.0.103
+.\tools\bin\MatchProbe.exe 192.168.1.100 192.168.1.101
 ```
 
 参数是你想额外扫描的地址（除了队列端口里已解析出的地址之外）。**不扫整个 /24**——那需要 510 次多探针超时，没必要。
@@ -48,18 +48,18 @@ $csc = 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 
 ```
 === queues ===
-  [Canon MF210 (TCP)]        kind=TCP/IP port=IP_192.168.0.103 raw=192.168.0.103 ip=192.168.0.103 fixable=True
+  [Canon MF210 (TCP)]        kind=TCP/IP port=IP_192.168.1.101 raw=192.168.1.101 ip=192.168.1.101 fixable=True
   ...
 
 === port dictionary ===        <- 关键：端口键与实际读到的地址
-  key=[IP_192.168.0.103] len=16 host=[192.168.0.103] port=9100 proto=1
+  key=[IP_192.168.1.101] len=16 host=[192.168.1.101] port=9100 proto=1
   ...
 
 === liveness ===
-  Canon MF210 (TCP) 192.168.0.103 alive=True ping=True 33ms
+  Canon MF210 (TCP) 192.168.1.101 alive=True ping=True 33ms
 
 === sweep ===
-  192.168.0.103  name=MF210 model=CANON MF210 state=3 reasons=none serial=...
+  192.168.1.101  name=MF210 model=CANON MF210 state=3 reasons=none serial=...
   ...
 
 === match ===
