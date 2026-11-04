@@ -25,7 +25,7 @@ namespace PrinterIpFix
         }
     }
 
-    /// <summary>驱动库的枚举、匹配与安装。全部只读本机，不联网下包。</summary>
+    /// <summary>驱动库的枚举、匹配与安装。只读本机已装驱动与本地目录，联网下载由 DriverOnline 负责。</summary>
     internal static class DriverStore
     {
         // ---------------- 目录 ----------------

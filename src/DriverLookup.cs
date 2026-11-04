@@ -232,6 +232,9 @@ namespace PrinterIpFix
                 req.Timeout = timeoutMs;
                 req.ReadWriteTimeout = timeoutMs;
                 req.AllowAutoRedirect = true;
+                // 关掉系统代理自动探测：开着时 .NET 每次建连都可能先去问 WPAD，单次就卡十几秒，
+                // 搜索页一轮下来像死机（实测 --drvsearch 两分钟不出结果就是这么来的）。
+                req.Proxy = null;
                 req.AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate;
 
                 using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())

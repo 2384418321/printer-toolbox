@@ -47,6 +47,10 @@ namespace PrinterIpFix
                 ? v + " " + m : m).Trim();
 
             // 1) 先按站点目录规则直接猜详情页 —— 猜中就不走搜索
+            // 整个查找必须有时限：4 个猜测页 + 搜索页 + 详情页 + 每条下载链接的 302
+            // 如果每次都吃满 timeoutMs，总共能跑几分钟，界面看起来就是「卡死」。
+            // 所以统一走一个截止时间，每次请求只用剩余的额度。
+            DateTime deadline = DateTime.Now.AddMilliseconds(timeoutMs);
             List<string> pages = new List<string>();
             string vs = DriverLookup.VendorSlug(keyword);
             string ms = DriverLookup.ModelSlug(m);
@@ -55,19 +59,24 @@ namespace PrinterIpFix
                 string[] guesses = DriverLookup.GuessPages(vs, ms);
                 for (int i = 0; i < guesses.Length; i++)
                 {
-                    if (DriverLookup.Exists(guesses[i], timeoutMs)) { pages.Add(guesses[i]); break; }
+                    int left = LeftMs(deadline);
+                    if (left <= 1000) break;
+                    if (DriverLookup.Exists(guesses[i], Math.Min(left, 6000))) { pages.Add(guesses[i]); break; }
                 }
             }
 
             // 2) 猜不中就走站内搜索（取前 3 条）
             if (pages.Count == 0)
             {
-                List<DriverPage> hits = DriverLookup.Search(keyword, timeoutMs, out error);
+                int left = LeftMs(deadline);
+                if (left <= 1500) { error = "查找超时（站点响应太慢）。"; LastNote = "查找超时，未拿到结果。"; return found; }
+                List<DriverPage> hits = DriverLookup.Search(keyword, Math.Min(left, timeoutMs), out error);
                 for (int i = 0; i < hits.Count && i < 3; i++) pages.Add(hits[i].Url);
             }
             if (pages.Count == 0)
             {
                 if (error.Length == 0) error = "站内没有「" + keyword + "」对应的驱动页。";
+                LastNote = "关键词「" + keyword + "」；没找到详情页。";
                 return found;
             }
 
@@ -75,10 +84,13 @@ namespace PrinterIpFix
             int budget = 10;
             for (int i = 0; i < pages.Count && budget > 0; i++)
             {
+                int left = LeftMs(deadline);
+                if (left <= 1500) break;
+
                 string html;
                 int st;
                 string err;
-                if (!FetchPage(pages[i], timeoutMs, out html, out st, out err)) continue;
+                if (!FetchPage(pages[i], Math.Min(left, timeoutMs), out html, out st, out err)) continue;
 
                 MatchCollection links = Regex.Matches(html,
                     "href=\"(/plus/download\\.php[^\"]+)\"[^>]*>(.*?)</a>",
@@ -86,6 +98,9 @@ namespace PrinterIpFix
 
                 for (int k = 0; k < links.Count && budget > 0; k++)
                 {
+                    int left2 = LeftMs(deadline);
+                    if (left2 <= 1200) { budget = 0; break; }
+
                     string href = links[k].Groups[1].Value.Replace("&amp;", "&");
                     string title = StripTags(links[k].Groups[2].Value);
                     if (href.Length == 0) continue;
@@ -96,7 +111,7 @@ namespace PrinterIpFix
                     d.Title = title.Length > 0 ? title : KeywordName(keyword);
 
                     string rerr;
-                    string real = ResolveRedirect(d.LinkUrl, timeoutMs, out rerr);
+                    string real = ResolveRedirect(d.LinkUrl, Math.Min(left2, timeoutMs), out rerr);
                     d.RealUrl = real;
 
                     bool dup = false;
@@ -113,6 +128,15 @@ namespace PrinterIpFix
             if (found.Count == 0 && error.Length == 0)
                 error = "页面打开了，但没解析出下载链接（站点结构可能变了）。";
             return found;
+        }
+
+        /// <summary>距离截止时间还剩多少毫秒（负数归零）。</summary>
+        private static int LeftMs(DateTime deadline)
+        {
+            long left = (long)(deadline - DateTime.Now).TotalMilliseconds;
+            if (left < 0) return 0;
+            if (left > int.MaxValue) return int.MaxValue;
+            return (int)left;
         }
 
         private static string KeywordName(string keyword)
@@ -352,6 +376,7 @@ namespace PrinterIpFix
                 req.AllowAutoRedirect = false;
                 req.Timeout = timeoutMs;
                 req.ReadWriteTimeout = timeoutMs;
+                req.Proxy = null;   // 关掉系统代理自动探测：开着时 .NET 会去问 WPAD，单次能卡十几秒
 
                 using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
                 {
@@ -398,6 +423,7 @@ namespace PrinterIpFix
                 req.Accept = "text/html,application/xhtml+xml";
                 req.Timeout = timeoutMs;
                 req.ReadWriteTimeout = timeoutMs;
+                req.Proxy = null;   // 同上：不要走自动代理探测
                 req.AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate;
 
                 using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())

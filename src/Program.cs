@@ -37,6 +37,21 @@ namespace PrinterIpFix
                 }
             }
 
+            // 无头驱动自检：--drvcheck <ip> [--capture]
+            // 默认只问设备支持哪些语言、列本机驱动、打印判定矩阵，绝不打印；
+            // 加 --capture 才真建临时队列打测试页抓驱动输出语言（费纸）。
+            // --drvsearch 也必须走无头分支：单独给 --drvsearch（不带 --drvcheck）时
+            // 之前会落到 Application.Run(new ToolboxForm())，命令行看不到任何输出、只能等 GUI，
+            // 从外面看就是「卡死两分钟」（实测 exit 124）。
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (args[i] == "--drvcheck" || args[i] == "--drvsearch")
+                {
+                    Environment.ExitCode = DriverSelfTest.Run(args);
+                    return;
+                }
+            }
+
             // 提权重开自己时走无界面路径：--apply-shared <ids> / --revert-shared / --diagnose-shared
             for (int i = 0; i < args.Length; i++)
             {

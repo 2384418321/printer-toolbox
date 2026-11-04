@@ -9,7 +9,9 @@ namespace PrinterIpFix
     /// <summary>
     /// 无桌面自检：把窗口在屏幕外创建一次，导出全部控件的实际坐标尺寸。
     /// 用于在没有可视桌面的环境里核对布局（是否越界、是否重叠、是否被挤压到 0）。
-    /// 参数 --add 改为导出「添加打印机」对话框。
+    /// 参数 --add 改为导出「添加打印机」对话框；
+    /// 参数 --toolbox 导出工具箱外壳（含各页签）；
+    /// 参数 --drvrepair 导出「驱动修复」对话框。
     /// </summary>
     internal static class UiDump
     {
@@ -19,14 +21,23 @@ namespace PrinterIpFix
 
             bool add = false;
             bool toolbox = false;
+            bool drvrepair = false;
             for (int i = 0; i < args.Length; i++)
             {
                 if (string.Equals(args[i], "--add", StringComparison.OrdinalIgnoreCase)) add = true;
                 if (string.Equals(args[i], "--toolbox", StringComparison.OrdinalIgnoreCase)) toolbox = true;
+                if (string.Equals(args[i], "--drvrepair", StringComparison.OrdinalIgnoreCase)) drvrepair = true;
             }
 
             Form f;
-            if (toolbox)
+            if (drvrepair)
+            {
+                // 反射构造，避免本轮之前的构建里没有这个类型时直接编不过
+                Type t = typeof(UiDump).Assembly.GetType("PrinterIpFix.DriverRepairForm");
+                if (t == null) { Console.WriteLine("DriverRepairForm 不在这个程序集里"); return 2; }
+                f = (Form)Activator.CreateInstance(t, new object[] { "OfficeJet Pro 9730", "192.168.1.100", "IP_192.168.1.100" });
+            }
+            else if (toolbox)
             {
                 // 反射构造，避免 gui 版编译时依赖 ToolboxForm
                 Type t = typeof(UiDump).Assembly.GetType("PrinterIpFix.ToolboxForm");

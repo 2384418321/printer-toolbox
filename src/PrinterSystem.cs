@@ -273,7 +273,7 @@ namespace PrinterIpFix
                 40000, out output);
         }
 
-        private static string Q(string s)
+        public static string Q(string s)
         {
             return "'" + (s == null ? "" : s.Replace("'", "''")) + "'";
         }

@@ -37,6 +37,7 @@ namespace PrinterIpFix
         private Button btnAddPrinter;
         private Button btnHelp;
         private Button btnCalibrate;
+        private Button btnDrvRepair;
         private Label lblPrinterHint;
         private Label lblDeviceHint;
 
@@ -58,6 +59,8 @@ namespace PrinterIpFix
         // 每条路线后面都跟 WaitGone（3~4 秒），一台就可能十几秒。
         // 放在主线程同步跑就会「点删除后界面卡死」，所以挪到后台线程。
         private volatile bool _deleting;
+        // 驱动校准单飞守卫：这一步要建临时队列真打测试页、还要逐个试驱动，几十秒到几分钟。
+        private volatile bool _drvCalibrating;
         // 上一次「自动匹配完成」时报的台数，用来避免每次都重复同一句。
         private int _lastMatched = -1;
 
@@ -85,14 +88,16 @@ namespace PrinterIpFix
             // ---- 底部日志 + 按钮 ----
             var bottom = new Panel();
             bottom.Dock = DockStyle.Bottom;
-            bottom.Height = 186;
+            bottom.Height = 224;
             bottom.Padding = new Padding(8, 4, 8, 6);
 
+            // 按钮已经排到 12 个，一行放不下（120 DPI 下每个按钮约 98~110px，父容器 1152）。
+            // 让它自动换行成两行，比死命压窄宽度导致文字被截断稳得多。
             var btnRow = new FlowLayoutPanel();
             btnRow.Dock = DockStyle.Top;
-            btnRow.Height = 38;
+            btnRow.Height = 76;
             btnRow.FlowDirection = FlowDirection.LeftToRight;
-            btnRow.WrapContents = false;
+            btnRow.WrapContents = true;
             btnRow.Padding = new Padding(0, 2, 0, 4);
 
             btnAuto = MakeButton("自动匹配并修复", 100);
@@ -133,6 +138,10 @@ namespace PrinterIpFix
             btnCalibrate = MakeButton("校准IP", 78);
             btnCalibrate.Click += delegate { OnCalibrate(); };
 
+            // 驱动修复：联网搜官方驱动 + 一键下载安装 + 手动搜索 + 兼容性判定（设备认什么语言 / 当前驱动吐什么语言）
+            btnDrvRepair = MakeButton("驱动修复", 88);
+            btnDrvRepair.Click += delegate { OnDriverRepair(); };
+
             btnRow.Controls.Add(btnAuto);
             btnRow.Controls.Add(btnBind);
             btnRow.Controls.Add(btnDefault);
@@ -143,6 +152,7 @@ namespace PrinterIpFix
             btnRow.Controls.Add(btnReprobe);
             btnRow.Controls.Add(btnRefresh);
             btnRow.Controls.Add(btnCalibrate);
+            btnRow.Controls.Add(btnDrvRepair);
             btnRow.Controls.Add(btnHelp);
 
             txtLog = new TextBox();
@@ -855,6 +865,57 @@ namespace PrinterIpFix
             });
             th.IsBackground = true;
             th.Start();
+        }
+
+        /// <summary>
+        /// 打开「驱动修复」对话框。把当前选中的队列/设备信息带过去，这样：
+        /// 型号能预填搜索结果，IP 能直接跑兼容判定（设备认什么语言），
+        /// 端口能直接抓到「这台机器现在这个驱动吐什么语言」。
+        /// </summary>
+        private void OnDriverRepair()
+        {
+            string model = "";
+            string ip = "";
+            string port = "";
+
+            PrinterInfo p = GetSelectedPrinter();
+            DeviceInfo d = GetSelectedDevice();
+
+            if (d != null)
+            {
+                ip = d.Ip;
+                if (d.Model.Length > 0) model = d.Model;
+                else if (d.IppName.Length > 0) model = d.IppName;
+            }
+
+            if (p != null)
+            {
+                port = p.PortName;
+                if (ip.Length == 0 && p.ResolvedIp.Length > 0) ip = p.ResolvedIp;
+                // 队列行没有型号，用驱动名洗一下当搜索词（去掉 ",3,Windows x64" 等尾巴）
+                if (model.Length == 0) model = CleanDriverSearchWord(p.DriverName);
+            }
+
+            using (var dlg = new DriverRepairForm(model, ip, port))
+            {
+                dlg.ShowDialog(this);
+            }
+            // 对话框里可能装了驱动 / 换了驱动，回来后刷新一次队列让界面跟上
+            ReloadPrinters(false);
+        }
+
+        /// <summary>把驱动名洗成适合搜索的型号词。</summary>
+        private static string CleanDriverSearchWord(string driverName)
+        {
+            if (driverName == null) return "";
+            string s = driverName;
+            int cut = s.IndexOf(',');
+            if (cut > 0) s = s.Substring(0, cut);
+            s = s.Replace("(USB Group 2)", "").Replace("(USB Group 1)", "");
+            s = s.Replace("Universal Printing", "").Replace("Universal Print", "");
+            s = s.Replace("Point and Print compatibility driver", "");
+            s = s.Replace("Class Driver", "");
+            return s.Trim();
         }
 
         private void OnBind()

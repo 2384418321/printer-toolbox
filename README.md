@@ -1,8 +1,8 @@
 # PrinterToolbox · 打印机工具箱
 
-> 一个 154 KB 的单文件 Windows 工具，专门解决「打印机换了 IP，队列里的活全卡着不出纸」这一类问题。
+> 一个约 243 KB 的单文件 Windows 工具，专门解决「打印机换了 IP，队列里的活全卡着不出纸」这一类问题。
 
-单文件、免安装、不需要 .NET SDK、不联网、不收集任何数据。双击即用。
+单文件、免安装、不需要 .NET SDK、不收集任何数据。双击即用。默认完全离线（只在本网段发 TCP/ping 探测、只读本机注册表和 WMI）；只有你在「驱动修复」里主动点搜索/下载时才会访问驱动站与厂商站点。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-blue)]()
@@ -31,6 +31,7 @@ Windows 自带的「疑难解答」修不好这类问题，因为它不知道队
 - **重新探测**：只重扫设备、不动队列设置，保留当前选中和匹配结果。
 - **刷新队列**：重新枚举本机队列（会重置选中状态）。
 - **绑定所选 →**：自动配不上（或配错了）时，手动把左边某个队列绑到右边某台设备。
+- **校准IP**：不扫全网、只看绑定表里记过的那几台设备。设备换过 IP 就按 UUID/序列号把它认回来，把端口指针改到新地址；认不出来就明说，不瞎改。首次点会先自动认一遍本机队列对应的设备（只读，不动任何设置）。命令行等价：`PrinterToolbox.exe --calibrate`
 - **设为默认 / 打印测试页 / 删除队列 / 添加打印机 / 使用说明**
 - **打印测试页**：走 Windows 队列（spooler → 端口 → 设备），验证整条链路。
 - **IPP 直发**：绕开 Windows 队列，先问设备「你支持哪些文档格式」，再按格式把测试页直接交给设备（IPP `Print-Job` 到 631 端口）。见下面「Windows 说打印成功但不出纸」。
@@ -119,8 +120,14 @@ PrinterToolbox.exe --ipp-test 192.168.1.100 --send   # 再发一次，看是否�
 - **③ 自动匹配**：给每台设备算最合适的本机驱动，给出匹配依据和分数；配不上时给「通用驱动兜底」建议。
 - **装建议驱动**：用 `pnputil` 装选中的 INF。**需要管理员**，非管理员会明确提示而不是静默失败。
 - **打开驱动入口**：按设备型号生成驱动站搜索链接，浏览器打开自己挑。
+- **驱动修复（联网）**：打开一个专门对话框，三件事一起做——
+  1. **搜官方包**：按型号去驱动站查详情页，跟随 302 拿到厂商官方直链（HP 的会落到 `ftp.hp.com`），可「仅下载」也可「下载并安装」；也能手动改关键词搜，或直接开厂商官网。
+  2. **判定兼容**：先问设备自己支持哪些页面语言（`@PJL INFO CONFIG`），再建一个临时队列、真打一份、抓驱动实际吐出的字节头（`%PDF` / `ENTER LANGUAGE=PCLXL` …），两者求交后给三态结论。**不打印就不判定**，因为这只能实测。
+  3. **自动换驱动**：判定不兼容时，遍历本机已装驱动逐个试，找到能出设备认的语言的就用 `Set-Printer -DriverName` 原地换过去（免管理员），换完回读确认。
 
-驱动来源就两个：**本机已装的** + **你放进驱动文件夹的**。工具不联网下驱动——驱动站没有稳定 API，硬爬只会给你一堆错的包，不如让你自己挑。
+命令行等价：`PrinterToolbox.exe --drvcheck <IP>`（只判定、绝不打印）、`--drvcheck <IP> --capture`（抓包，会打测试页）、`--drvsearch <型号关键词>`（只搜不下载）。
+
+驱动来源三个：**本机已装的** + **你放进驱动文件夹的** + **驱动修复对话框联网搜到的官方包**。默认不自动下载，每条都要你点。
 
 ### ⑤ 说明
 
@@ -247,17 +254,26 @@ csc /target:exe /langversion:5 /out:bin\MatchProbe.exe ^
 printer-toolbox\
   build-toolbox.ps1          编译 + 可选签名 + 回读校验
   src\
-    Program.cs               入口（--dump-ui / --apply-shared / --revert-shared / --diagnose-shared）
+    Program.cs               入口（--dump-ui / --ipp-test / --calibrate / --drvcheck / --drvsearch / --apply-shared 等）
     ToolboxForm.cs           主窗口：四个页签
     MainForm.cs              页签①：校准 / 队列
     AddPrinterForm.cs        「添加打印机」对话框（网络 / USB）
+    DriverRepairForm.cs      「驱动修复」对话框（联网搜包 / 兼容判定 / 自动换驱动）
     SharedFixPanel.cs        页签②：共享修复（含注册表备份与还原）
     DriverPanel.cs           页签③：驱动检测
     DriverStore.cs           驱动库枚举 / 匹配 / pnputil 安装
     DriverLookup.cs          驱动站搜索链接与型号推断
+    DriverCompat.cs          设备语言探测 + 驱动输出抓包 + 兼容判定 + 原地换驱动
     PrinterSystem.cs         打印子系统读写（多路线回退 + 回读校验）
     Scanner.cs               网段扫描、TCP/ping 探测、IPP 身份解析
-    Ipp.cs                   手写 IPP 协议（大端序处理）
+    Ipp.cs                   手写 IPP 协议（大端序处理，含 Print-Job）
+    IppPrint.cs              生成测试页 JPEG / 判断 Windows 队列能不能打
+    IppSelfTest.cs           无头 IPP 自检（--ipp-test）
+    IppFilePrint.cs          文件直发（图片直发 / PDF 渲染后直发）
+    IpRebind.cs              队列与设备的身份绑定表、换 IP 后自动校准
+    IpRebindSelfTest.cs      无头校准（--calibrate）
+    DriverSelfTest.cs        无头驱动自检与联网搜索（--drvcheck / --drvsearch）
+    DriverOnline.cs          驱动站查找 / 下载 / 解包 / 安装
     Matcher.cs               队列-设备打分匹配
     Model.cs                 数据模型
     SelfTest.cs              自检
@@ -270,7 +286,10 @@ printer-toolbox\
   dist\                      编译产物（.gitignore 忽略）
 ```
 
-运行时数据目录：`%ProgramData%\PrinterToolbox\`（备份 / 驱动库 / 日志）。
+运行时数据目录优先 `%ProgramData%\PrinterToolbox\`（备份 / 驱动库 / 日志）；写不进去时按
+`%LOCALAPPDATA%\PrinterToolbox` → `%TEMP%\PrinterToolbox` → exe 同目录 `PrinterToolbox-Data`
+逐级回退。低完整性进程（沙箱、某些远程会话）连 `%APPDATA%` 都写不了，不回退就什么都存不下来，
+表现是「换 IP 后校准记不住设备」——绑定表 `bindings.tsv` 会落在第一个真正可写的那一级。
 
 ---
 
@@ -280,7 +299,9 @@ printer-toolbox\
 - **只认 IPv4**。IPv6 打印设备未实现。
 - **IPP over 631 only**。用 9100 裸端口或 LPD 515 行协议的设备只能读到 TCP 可达性，读不到型号/序列号，因此只能靠地址匹配。
 - **写动作需要管理员**。文档里「已实测 / 未实测」章节有详细说明。
-- **不联网下载驱动**。见页签④说明。
+- **驱动兼容判定必须真打一张**。`--drvcheck` 的「判定兼容」要抓驱动实际输出，只能建临时队列打一页测试页再读字节；`--capture` 和界面上的「判定兼容」都会耗一张纸，所以默认不自动跑。不想耗纸就用 `--drvcheck <IP>`（只读设备语言表 + 判定矩阵，不打印）。
+- **联网搜驱动依赖站点结构**。走的是驱动站的搜索页与详情页正则，站点改版就会解析不到（会明确报「页面打开了，但没解析出下载链接」）。找不到时对话框里有「厂商官网」按钮兜底。
+- **PDF 文件直发暂未接入界面**。`--ipp-test` 和「IPP 直发」按钮现在只处理 JPEG/PNG/TIFF 以及内置测试页；把 PDF 逐页渲染成 JPEG 的那条路径依赖 WinRT（`Windows.Data.Pdf`），在 .NET Framework 4 进程内加载会报 `HRESULT 0x80131515`，所以先留空。要打 PDF，先在阅读器里「打印为图片」，或用系统里能打的队列。
 
 ---
 

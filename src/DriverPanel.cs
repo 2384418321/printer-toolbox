@@ -59,37 +59,43 @@ namespace PrinterIpFix
             bar.WrapContents = false;
             bar.FlowDirection = FlowDirection.LeftToRight;
 
-            Button bDev = MakeButton("① 扫描设备", 110);
+            // 按钮宽度都收到 100 及以下，才能给新增的「驱动修复(联网)」留出位置。
+            // 这一行原来是 6 个 110 宽按钮 + 420 宽标签，加任何一个都会溢出父容器。
+            Button bDev = MakeButton("① 扫描设备", 100);
             bDev.Click += delegate { ScanDevices(); };
 
-            Button bDrv = MakeButton("② 读驱动库", 110);
+            Button bDrv = MakeButton("② 读驱动库", 100);
             bDrv.Click += delegate { ScanDrivers(); };
 
-            Button bMatch = MakeButton("③ 自动匹配", 110);
+            Button bMatch = MakeButton("③ 自动匹配", 100);
             bMatch.Click += delegate { Rematch(); };
 
-            Button bInstall = MakeButton("装建议驱动", 110);
+            Button bInstall = MakeButton("装建议驱动", 100);
             bInstall.Click += delegate { InstallSelected(); };
 
-            Button bWeb = MakeButton("打开驱动入口", 110);
+            Button bWeb = MakeButton("打开驱动入口", 100);
             bWeb.Click += delegate { OpenSelectedSite(); };
 
-            Button bStore = MakeButton("驱动库目录", 100);
+            Button bRepair = MakeButton("驱动修复(联网)", 116);
+            bRepair.Click += delegate { OpenDriverRepair(); };
+
+            Button bStore = MakeButton("驱动库目录", 96);
             bStore.Click += delegate { OpenStore(); };
 
             lblInfo = new Label();
             lblInfo.AutoSize = false;
-            lblInfo.Width = 420;
+            lblInfo.Width = 300;
             lblInfo.Height = 26;
             lblInfo.TextAlign = ContentAlignment.MiddleLeft;
             lblInfo.ForeColor = Color.FromArgb(90, 90, 90);
-            lblInfo.Text = "先 ① 再 ②，然后 ③ 看推荐。驱动库目录为空时，用「打开驱动入口」去官网下包。";
+            lblInfo.Text = "先 ① 再 ②，然后 ③ 看推荐。库里没有就去「驱动修复」联网搜官方包。";
 
             bar.Controls.Add(bDev);
             bar.Controls.Add(bDrv);
             bar.Controls.Add(bMatch);
             bar.Controls.Add(bInstall);
             bar.Controls.Add(bWeb);
+            bar.Controls.Add(bRepair);
             bar.Controls.Add(bStore);
             bar.Controls.Add(lblInfo);
             root.Controls.Add(bar, 0, 0);
@@ -402,8 +408,8 @@ namespace PrinterIpFix
                     else
                     {
                         rows[i].BestDriver = "(库里没匹配)";
-                        rows[i].Verdict = "驱动库里没有匹配项，也没有同厂商通用驱动。去官网按型号下 Full 包，"
-                                        + "解压到驱动库目录后点「② 读驱动库」重新匹配。";
+                        rows[i].Verdict = "驱动库里没有匹配项，也没有同厂商通用驱动。点「驱动修复(联网)」按型号搜官方包"
+                                        + "（可直接下载并安装），或去官网下 Full 包解压到驱动库目录后点「② 读驱动库」重新匹配。";
                     }
                     rows[i].Url = DriverLookup.SearchUrl(model);
                 }
@@ -446,9 +452,10 @@ namespace PrinterIpFix
             {
                 MessageBox.Show(
                     "这一行在驱动库里没有匹配到可用条目，没有可装的东西。\r\n\r\n"
-                  + "两条路：\r\n"
-                  + "1) 点「打开驱动入口」去官网下对应型号的驱动包，解压到驱动库目录，再点「读驱动库」重新匹配；\r\n"
-                  + "2) 直接用设备自带的 USB 线接上，让 Windows 自己装通用驱动。",
+                  + "三条路：\r\n"
+                  + "1) 点「驱动修复(联网)」按型号搜官方包，可「仅下载」或「下载并安装」；\r\n"
+                  + "2) 点「打开驱动入口」去官网下对应型号的驱动包，解压到驱动库目录，再点「读驱动库」重新匹配；\r\n"
+                  + "3) 直接用设备自带的 USB 线接上，让 Windows 自己装通用驱动。",
                     "装驱动", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
@@ -542,6 +549,56 @@ namespace PrinterIpFix
                 Log("把官网下的驱动包解压到这里，再点「② 读驱动库」。");
             }
             catch (Exception ex) { Log("打不开目录：" + ex.Message); }
+        }
+
+        /// <summary>
+        /// 打开「驱动修复」对话框（联网搜官方驱动 + 一键下载安装 + 手动搜索 + 兼容性判定）。
+        /// 从选中的设备行里带出型号/IP/端口；选的是队列就把队列的端口带过去，那样兼容判定能直接抓到
+        /// 这台机器当前驱动吐什么语言。
+        /// </summary>
+        private void OpenDriverRepair()
+        {
+            string model = "";
+            string ip = "";
+            string port = "";
+
+            DeviceRow r = Selected();
+            if (r != null)
+            {
+                model = r.Model == null ? "" : r.Model;
+                port = r.Port == null ? "" : r.Port;
+                // 队列行的 Model 存的是驱动名，不是设备型号 —— 换成更合适的搜索词：
+                // 优先用设备行里已经拿到的型号，没有就把驱动名去掉后缀再用。
+                if (r.State == "已装队列")
+                {
+                    model = CleanDriverName(model);
+                }
+
+                if (port.Length > 0)
+                {
+                    Dictionary<string, PortInfo> ports = PrinterSystem.GetTcpPorts();
+                    PortInfo pi = null;
+                    if (ports.TryGetValue(port, out pi) && pi != null && pi.HostAddress.Length > 0)
+                        ip = pi.HostAddress;
+                }
+            }
+
+            DriverRepairForm f = new DriverRepairForm(model, ip, port);
+            f.ShowDialog(FindForm());
+        }
+
+        /// <summary>把驱动名洗成适合搜索的型号词（去掉 ",3,Windows x64"、"(USB Group 2)" 这类尾巴）。</summary>
+        private static string CleanDriverName(string driverName)
+        {
+            if (driverName == null) return "";
+            string s = driverName;
+            int cut = s.IndexOf(',');
+            if (cut > 0) s = s.Substring(0, cut);
+            s = s.Replace("(USB Group 2)", "").Replace("(USB Group 1)", "");
+            s = s.Replace("Universal Printing", "").Replace("Universal Print", "");
+            s = s.Replace("Class Driver", "").Replace("Print Class Driver", "");
+            s = s.Replace("Point and Print compatibility driver", "");
+            return s.Trim();
         }
     }
 }
