@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Management;
 using System.Text;
 using System.Windows.Forms;
 using Microsoft.Win32;
@@ -15,10 +16,29 @@ namespace PrinterIpFix
         public string SubKey;
         public string Name;
         public int Value;
+        /// <summary>该值「不存在」时系统的等效行为，按 ADMX 的默认值填。
+        /// 缺了它就会把「出厂默认」误判成「未达标」——很多默认值本身就是安全状态。</summary>
+        public int AbsentAs;
+        /// <summary>ADMX 枚举含义，写进体检输出供人对照，避免只看到裸数字。</summary>
+        public string Note;
 
         public FixOp(RegistryHive hive, string subKey, string name, int value)
         {
-            Hive = hive; SubKey = subKey; Name = name; Value = value;
+            Hive = hive; SubKey = subKey; Name = name; Value = value; AbsentAs = value; Note = "";
+        }
+
+        public FixOp(RegistryHive hive, string subKey, string name, int value, int absentAs, string note)
+        {
+            Hive = hive; SubKey = subKey; Name = name; Value = value; AbsentAs = absentAs; Note = note;
+        }
+
+        /// <summary>把「不存在」折成系统实际生效的值，再拿来比较。</summary>
+        public int Effective(object current)
+        {
+            if (current == null) return AbsentAs;
+            if (current is int) return (int)current;
+            try { return Convert.ToInt32(current); }
+            catch { return AbsentAs; }
         }
     }
 
@@ -32,6 +52,8 @@ namespace PrinterIpFix
         public List<FixOp> Ops = new List<FixOp>();
         /// <summary>附加命令（netsh / dism / net），按顺序用 cmd /c 执行，可为 null。</summary>
         public string[] Commands;
+        /// <summary>命令型项的体检程序：返回人可读的现状行。null 表示本项没有体检能力。</summary>
+        public Func<List<string>> Probe;
 
         public string RiskText()
         {
@@ -82,7 +104,9 @@ namespace PrinterIpFix
         private const string RpcKey = @"SOFTWARE\Policies\Microsoft\Windows NT\Printers\RPC";
         private const string LmWkKey = @"SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters";
         private const string LmWkPolicy = @"SOFTWARE\Policies\Microsoft\Windows\LanmanWorkstation";
-        private const string DrvSearch = @"SOFTWARE\Microsoft\Windows\CurrentVersion\DriverSearching";
+        /// <summary>SearchOrderConfig 的官方位置是策略键（ADMX: DeviceSetup.admx），
+        /// 不是 CurrentVersion；写在非策略键上组策略/驱动安装向导都不认。</summary>
+        private const string DrvSearch = @"SOFTWARE\Policies\Microsoft\Windows\DriverSearching";
 
         public static List<FixItem> Build()
         {
@@ -96,7 +120,7 @@ namespace PrinterIpFix
                      + "改的是 HKLM\\SYSTEM\\CurrentControlSet\\Control\\Print : RpcAuthnLevelPrivacyEnabled = 0\n"
                      + "副作用：等于放宽回补丁前的认证要求，只在客户端无法升级时用。";
             a.Risk = 1;
-            a.Ops.Add(new FixOp(RegistryHive.LocalMachine, PrintKey, "RpcAuthnLevelPrivacyEnabled", 0));
+            a.Ops.Add(new FixOp(RegistryHive.LocalMachine, PrintKey, "RpcAuthnLevelPrivacyEnabled", 0, 1, "1=启用隐私认证（未配置即此） 0=关闭"));
             list.Add(a);
 
             FixItem b = new FixItem();
@@ -106,7 +130,7 @@ namespace PrinterIpFix
                      + "PointAndPrint : RestrictDriverInstallationToAdministrators = 0\n"
                      + "副作用：这是 PrintNightmare 的缓解项之一，关掉后任何能连到共享的人都能装驱动。";
             b.Risk = 1;
-            b.Ops.Add(new FixOp(RegistryHive.LocalMachine, PnpKey, "RestrictDriverInstallationToAdministrators", 0));
+            b.Ops.Add(new FixOp(RegistryHive.LocalMachine, PnpKey, "RestrictDriverInstallationToAdministrators", 0, 1, "1=仅管理员可装（未配置即此） 0=允许非管理员"));
             list.Add(b);
 
             FixItem c = new FixItem();
@@ -114,11 +138,13 @@ namespace PrinterIpFix
             c.Title = "驱动安装时不再弹提权/警告框";
             c.Detail = "连共享打印机时 Windows 会弹「是否信任此打印机」并要求管理员确认，"
                      + "某些环境下确认了也装不上。\n"
-                     + "PointAndPrint : NoWarningNoElevationOnInstall = 0、UpdatePromptSettings = 0\n"
+                     + "PointAndPrint : NoWarningNoElevationOnInstall = 1、UpdatePromptSettings = 2\n"
+                     + "（ADMX 枚举：安装项 0=警告并提权、1=不警告不提权；更新项 0=警告并提权、1=警告不提权、2=不警告不提权。"
+                     + "写 0 等于什么都没改。）\n"
                      + "副作用：降低提示门槛。";
             c.Risk = 1;
-            c.Ops.Add(new FixOp(RegistryHive.LocalMachine, PnpKey, "NoWarningNoElevationOnInstall", 0));
-            c.Ops.Add(new FixOp(RegistryHive.LocalMachine, PnpKey, "UpdatePromptSettings", 0));
+            c.Ops.Add(new FixOp(RegistryHive.LocalMachine, PnpKey, "NoWarningNoElevationOnInstall", 1, 0, "0=警告并提权（未配置即此） 1=不警告不提权"));
+            c.Ops.Add(new FixOp(RegistryHive.LocalMachine, PnpKey, "UpdatePromptSettings", 2, 0, "0=警告并提权（未配置即此） 1=警告不提权 2=不警告不提权"));
             list.Add(c);
 
             FixItem d = new FixItem();
@@ -128,8 +154,8 @@ namespace PrinterIpFix
                      + "LanmanWorkstation\\Parameters : AllowInsecureGuestAuth = 1（本机 + 策略两处）\n"
                      + "副作用：允许无凭据 SMB 访问，公司网内更推荐给共享设账号后用「连接共享打印机」并保存凭据。";
             d.Risk = 1;
-            d.Ops.Add(new FixOp(RegistryHive.LocalMachine, LmWkKey, "AllowInsecureGuestAuth", 1));
-            d.Ops.Add(new FixOp(RegistryHive.LocalMachine, LmWkPolicy, "AllowInsecureGuestAuth", 1));
+            d.Ops.Add(new FixOp(RegistryHive.LocalMachine, LmWkKey, "AllowInsecureGuestAuth", 1, 0, "1=允许来宾 0=拒绝来宾（未配置即此）"));
+            d.Ops.Add(new FixOp(RegistryHive.LocalMachine, LmWkPolicy, "AllowInsecureGuestAuth", 1, 0, "策略键，1=允许来宾 0=拒绝"));
             list.Add(d);
 
             FixItem e = new FixItem();
@@ -139,8 +165,8 @@ namespace PrinterIpFix
                      + "Printers\\RPC : RpcUseNamedPipeProtocol = 1、RpcProtocols = 7\n"
                      + "不含 ForceKerberosForRpc —— 工作组环境打开它反而连不上。";
             e.Risk = 0;
-            e.Ops.Add(new FixOp(RegistryHive.LocalMachine, RpcKey, "RpcUseNamedPipeProtocol", 1));
-            e.Ops.Add(new FixOp(RegistryHive.LocalMachine, RpcKey, "RpcProtocols", 7));
+            e.Ops.Add(new FixOp(RegistryHive.LocalMachine, RpcKey, "RpcUseNamedPipeProtocol", 1, 0, "0=RPC over TCP（未配置即此） 1=RPC over 命名管道"));
+            e.Ops.Add(new FixOp(RegistryHive.LocalMachine, RpcKey, "RpcProtocols", 7, 5, "3=仅命名管道 5=仅 TCP（未配置即此） 7=两者"));
             list.Add(e);
 
             FixItem f = new FixItem();
@@ -157,6 +183,7 @@ namespace PrinterIpFix
                 "netsh advfirewall firewall add rule name=\"PrinterToolbox LPR\" dir=in action=allow protocol=TCP localport=515",
                 "netsh advfirewall firewall add rule name=\"PrinterToolbox LPD\" dir=in action=allow protocol=TCP localport=721-731"
             };
+            f.Probe = delegate { return ProbeFirewall(); };
             list.Add(f);
 
             FixItem g = new FixItem();
@@ -171,6 +198,7 @@ namespace PrinterIpFix
                 "dism /online /enable-feature /featurename:Printing-Foundation-LPRPortMonitor /all /norestart",
                 "dism /online /enable-feature /featurename:Printing-Foundation-InternetPrinting-Client /all /norestart"
             };
+            g.Probe = delegate { return ProbeLpr(); };
             list.Add(g);
 
             FixItem h = new FixItem();
@@ -185,6 +213,7 @@ namespace PrinterIpFix
                 "del /f /q \"%SystemRoot%\\System32\\spool\\PRINTERS\\*.*\"",
                 "net start spooler"
             };
+            h.Probe = delegate { return ProbeSpooler(); };
             list.Add(h);
 
             FixItem i = new FixItem();
@@ -192,11 +221,11 @@ namespace PrinterIpFix
             i.Title = "装驱动时不联网搜 Windows Update";
             i.Detail = "驱动安装向导默认会去 Windows Update 找驱动，网络差时会卡很久，"
                      + "也常装上一个什么都不支持的通用驱动。\n"
-                     + "DriverSearching : DriverUpdateWizardWuSearchEnabled = 0、SearchOrderConfig = 0\n"
+                     + "策略键 DriverSearching : SearchOrderConfig = 0（ADMX DeviceSetup.admx：1=总是查 WU、2=需要时查、0=从不查）\n"
+                     + "注：早期版本还写过 DriverUpdateWizardWuSearchEnabled，但 Windows 10/11 的 ADMX 里没有这个值名，已移除。\n"
                      + "没有副作用，只是让安装过程可控。";
             i.Risk = 0;
-            i.Ops.Add(new FixOp(RegistryHive.LocalMachine, DrvSearch, "DriverUpdateWizardWuSearchEnabled", 0));
-            i.Ops.Add(new FixOp(RegistryHive.LocalMachine, DrvSearch, "SearchOrderConfig", 0));
+            i.Ops.Add(new FixOp(RegistryHive.LocalMachine, DrvSearch, "SearchOrderConfig", 0, 1, "1=总是查 Windows Update（未配置即此） 2=需要时查 0=从不查"));
             list.Add(i);
 
             return list;
@@ -269,32 +298,278 @@ namespace PrinterIpFix
 
         // ---------------- 诊断 / 应用 / 还原 ----------------
 
+        /// <summary>防火墙项体检：规则组是否启用、三条自定义规则是否在。</summary>
+        private static List<string> ProbeFirewall()
+        {
+            List<string> r = new List<string>();
+            // 「文件和打印机共享」规则组的本地化名资源 id：注册表值里存的是这个间接引用，
+            // 不是明文「文件和打印机共享」，按明文过滤恒 0 条。
+            const string GroupRef = "EmbedCtxt=@FirewallAPI.dll,-28502";
+            int groupTotal = 0, groupOn = 0;
+            string[] mine = new string[] { "PrinterToolbox SMB", "PrinterToolbox LPR", "PrinterToolbox LPD" };
+            bool[] mineFound = new bool[mine.Length];
+            bool registryOk = false;
+            try
+            {
+                // 走注册表而不是 netsh：受限令牌下 netsh 退出码 1，而这块注册表非管理员可读。
+                using (RegistryKey k = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64)
+                           .OpenSubKey(@"SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\FirewallRules"))
+                {
+                    if (k != null)
+                    {
+                        registryOk = true;
+                        string[] vnames = k.GetValueNames();
+                        for (int i = 0; i < vnames.Length; i++)
+                        {
+                            string v = k.GetValue(vnames[i], null) as string;
+                            if (string.IsNullOrEmpty(v)) continue;
+                            if (v.IndexOf(GroupRef, StringComparison.OrdinalIgnoreCase) >= 0)
+                            {
+                                groupTotal++;
+                                if (v.IndexOf("|Active=TRUE|", StringComparison.OrdinalIgnoreCase) >= 0) groupOn++;
+                            }
+                            for (int j = 0; j < mine.Length; j++)
+                            {
+                                if (v.IndexOf("|Name=" + mine[j], StringComparison.OrdinalIgnoreCase) >= 0)
+                                    mineFound[j] = true;
+                            }
+                        }
+                    }
+                }
+            }
+            catch { registryOk = false; }
+            if (!registryOk)
+            {
+                r.Add("读防火墙规则失败：注册表 FirewallRules 打不开，需要管理员。");
+                return r;
+            }
+            if (groupTotal == 0)
+                r.Add("未找到「文件和打印机共享」规则组（可能被组策略移除）。");
+            else
+                r.Add("规则组「文件和打印机共享」：" + groupOn + "/" + groupTotal + " 条已启用"
+                      + (groupOn == groupTotal ? "  [已达标]" : "  [未达标]"));
+            int nFound = 0;
+            for (int j = 0; j < mine.Length; j++)
+            {
+                if (mineFound[j]) nFound++;
+                r.Add("  " + mine[j] + "：" + (mineFound[j] ? "已存在  [已达标]" : "不存在  [未达标]"));
+            }
+            r.Add("自定义规则：" + nFound + "/" + mine.Length + " 条已存在"
+                  + (nFound == mine.Length ? "  [已达标]" : "  [未达标]"));
+            return r;
+        }
+
+        /// <summary>LPR/LPD 组件体检：读注册表里的可选功能状态，避免每次都跑 DISM。</summary>
+        private static List<string> ProbeLpr()
+        {
+            List<string> r = new List<string>();
+            string[] feats = new string[]
+            {
+                "Printing-Foundation-LPDPrintService",
+                "Printing-Foundation-LPRPortMonitor",
+                "Printing-Foundation-InternetPrinting-Client"
+            };
+            int on = 0;
+            for (int i = 0; i < feats.Length; i++)
+            {
+                // 可选功能状态在 HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\Packages
+                // 不好逐条判断，改用「服务/驱动是否注册」这个更直接的证据：
+                // LPD 服务是 lpdvctr，LPR 端口监视器是 LprMon，Internet 打印客户端是 inetpp。
+                string state = "";
+                if (feats[i] == "Printing-Foundation-LPDPrintService")
+                    state = ServiceExists("lpd") ? "已安装  [已达标]" : "未安装  [未达标]";
+                else if (feats[i] == "Printing-Foundation-LPRPortMonitor")
+                    state = MonitorExists("LPR Port") ? "已安装  [已达标]" : "未安装  [未达标]";
+                else
+                    state = DllExists("inetpp.dll") ? "已安装  [已达标]" : "未安装  [未达标]";
+
+                if (state.IndexOf("已达标", StringComparison.Ordinal) >= 0) on++;
+                r.Add("  " + feats[i] + "：" + state);
+            }
+            r.Add("组件：" + on + "/" + feats.Length + " 个已安装"
+                  + (on == feats.Length ? "  [已达标]" : "  [未达标]"));
+            if (on < feats.Length)
+                r.Add("  （非管理员也能读到这些证据；真要装仍需管理员跑 DISM）");
+            return r;
+        }
+
+        private static bool ServiceExists(string shortName)
+        {
+            try
+            {
+                using (RegistryKey k = Registry.LocalMachine.OpenSubKey(
+                    @"SYSTEM\CurrentControlSet\Services\" + shortName))
+                    return k != null;
+            }
+            catch { return false; }
+        }
+
+        private static bool MonitorExists(string monitorName)
+        {
+            try
+            {
+                using (RegistryKey k = Registry.LocalMachine.OpenSubKey(
+                    @"SYSTEM\CurrentControlSet\Control\Print\Monitors"))
+                {
+                    if (k == null) return false;
+                    string[] names = k.GetSubKeyNames();
+                    for (int i = 0; i < names.Length; i++)
+                        if (string.Equals(names[i], monitorName, StringComparison.OrdinalIgnoreCase)) return true;
+                    return false;
+                }
+            }
+            catch { return false; }
+        }
+
+        private static bool DllExists(string fileName)
+        {
+            try
+            {
+                string p = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), fileName);
+                return File.Exists(p);
+            }
+            catch { return false; }
+        }
+
+        /// <summary>Spooler 项体检：服务状态 + 队列里卡住的作业文件数。</summary>
+        private static List<string> ProbeSpooler()
+        {
+            List<string> r = new List<string>();
+            string outp;
+            int code = PrinterSystem.RunHidden("sc", "query spooler", 10000, out outp);
+            if (code == 0)
+            {
+                bool running = outp.IndexOf("RUNNING", StringComparison.OrdinalIgnoreCase) >= 0;
+                r.Add("Spooler 服务：" + (running ? "运行中  [已达标]" : "未运行  [未达标]"));
+            }
+            else r.Add("Spooler 服务：查询失败（退出码 " + code + "）");
+
+            try
+            {
+                // 走 Win32_PrintJob 而不是数 spool\PRINTERS 里的 .SHD/.SPL：
+                // 那个目录非管理员读不了（Access denied），WMI 这条路受限令牌也能读。
+                int jobs = 0, stuck = 0;
+                StringBuilder sbJobs = new StringBuilder();
+                using (var searcher = new ManagementObjectSearcher(
+                           "SELECT Name,Document,JobStatus,TotalPages FROM Win32_PrintJob"))
+                using (ManagementObjectCollection col = searcher.Get())
+                {
+                    foreach (ManagementObject mo in col)
+                    {
+                        using (mo)
+                        {
+                            jobs++;
+                            string st = Convert.ToString(mo["JobStatus"]);
+                            // 状态可能同时含「错误」与「正在打印」（实测 HP 队列里就有
+                            // 「错误 | 正在打印」），所以先判错误关键词，再判正常关键词
+                            bool err = st.IndexOf("Error", StringComparison.OrdinalIgnoreCase) >= 0
+                                       || st.IndexOf("Offline", StringComparison.OrdinalIgnoreCase) >= 0
+                                       || st.IndexOf("Blocked", StringComparison.OrdinalIgnoreCase) >= 0
+                                       || st.IndexOf("Deleting", StringComparison.OrdinalIgnoreCase) >= 0
+                                       || st.IndexOf("Retained", StringComparison.OrdinalIgnoreCase) >= 0
+                                       || st.IndexOf("Intervention", StringComparison.OrdinalIgnoreCase) >= 0
+                                       || st.IndexOf("错误", StringComparison.Ordinal) >= 0
+                                       || st.IndexOf("脱机", StringComparison.Ordinal) >= 0
+                                       || st.IndexOf("已阻止", StringComparison.Ordinal) >= 0
+                                       || st.IndexOf("删除中", StringComparison.Ordinal) >= 0
+                                       || st.IndexOf("保留", StringComparison.Ordinal) >= 0
+                                       || st.IndexOf("干预", StringComparison.Ordinal) >= 0;
+                            if (err) stuck++;
+                            if (sbJobs.Length < 500)
+                            {
+                                sbJobs.Append("\r\n      ");
+                                sbJobs.Append(Convert.ToString(mo["Name"]));
+                                sbJobs.Append("  文档=");
+                                sbJobs.Append(Convert.ToString(mo["Document"]));
+                                sbJobs.Append("  状态=");
+                                sbJobs.Append(st.Length == 0 ? "(无)" : st);
+                                sbJobs.Append("  页数=");
+                                sbJobs.Append(Convert.ToString(mo["TotalPages"]));
+                            }
+                        }
+                    }
+                }
+                r.Add("队列里的作业：" + jobs + " 个，卡住的 " + stuck + " 个"
+                      + (stuck == 0 ? "  [已达标]" : "  [未达标]（建议停服务清空队列）"));
+                if (jobs > 0) r.Add("  明细：" + sbJobs.ToString());
+            }
+            catch (Exception ex) { r.Add("读队列作业失败：" + ex.Message); }
+            return r;
+        }
+
         public static List<string> Diagnose()
         {
             List<string> log = new List<string>();
             List<FixItem> all = Build();
             log.Add("=== 每项修复的当前状态 ===");
+            log.Add("（「默认即达标」表示注册表里没这个值，但系统本来就按下面期望的行为在跑，不用改）");
+            int nDone = 0, nDefault = 0, nTodo = 0;
             for (int i = 0; i < all.Count; i++)
             {
                 FixItem it = all[i];
+
+                // 命令型项：真的去查防火墙/DISM/队列，而不是打一句「需手动执行」了事
                 if (it.Ops.Count == 0)
                 {
-                    log.Add("· " + it.Title + "：无注册表项（命令型，需手动执行）");
+                    List<string> probe = null;
+                    if (it.Probe != null)
+                    {
+                        try { probe = it.Probe(); }
+                        catch (Exception ex) { probe = new List<string>(); probe.Add("体检失败：" + ex.Message); }
+                    }
+                    if (probe == null)
+                    {
+                        log.Add("· " + it.Title + "：本项没有自动体检能力，执行后请按说明核对");
+                        nTodo++;
+                        continue;
+                    }
+                    // 命令型项也要参与汇总：只要探针输出了任意一行 [未达标] 就算要处理；
+                    // 全部 [已达标] 才算过。没有标签的说明行（如「非管理员也能读到…」）不参与判定。
+                    bool anyBad = false, anyGood = false;
+                    for (int k = 0; k < probe.Count; k++)
+                    {
+                        string ln = probe[k];
+                        if (ln.IndexOf("[未达标]", StringComparison.Ordinal) >= 0) anyBad = true;
+                        else if (ln.IndexOf("[已达标]", StringComparison.Ordinal) >= 0) anyGood = true;
+                    }
+                    string mark = anyBad ? "× " : (anyGood ? "√ " : "· ");
+                    log.Add(mark + it.Title);
+                    for (int k = 0; k < probe.Count; k++) log.Add("    " + probe[k]);
+                    if (anyBad) nTodo++;
+                    else if (anyGood) nDone++;
+                    else nTodo++;
                     continue;
                 }
-                bool done = true;
+
+                bool allDone = true, anyReal = false;
                 StringBuilder sb = new StringBuilder();
                 for (int j = 0; j < it.Ops.Count; j++)
                 {
-                    object cur = ReadValue(it.Ops[j]);
-                    bool ok = (cur != null && cur is int && (int)cur == it.Ops[j].Value);
-                    if (!ok) done = false;
-                    sb.Append("\r\n    " + it.Ops[j].Name + " = " + ValueText(cur)
-                             + "  → 期望 " + it.Ops[j].Value + (ok ? "  [已达标]" : "  [未达标]"));
+                    FixOp op = it.Ops[j];
+                    object cur = ReadValue(op);
+                    bool present = (cur != null);
+                    int eff = op.Effective(cur);
+                    bool ok = (eff == op.Value);
+                    if (ok) { if (present) anyReal = true; } else allDone = false;
+
+                    string tag = ok ? (present ? "  [已达标]" : "  [默认即达标]") : "  [未达标]";
+                    sb.Append("\r\n    " + op.Name + " = " + ValueText(cur)
+                              + "  → 期望 " + op.Value + tag);
+                    if (op.Note != null && op.Note.Length > 0) sb.Append("\r\n        " + op.Note);
+                    // 同名值写在两个键下（如 AllowInsecureGuestAuth），不打子键根本分不清
+                    sb.Append("\r\n        键：" + (op.Hive == RegistryHive.LocalMachine ? "HKLM" : "HKCU") + "\\" + op.SubKey);
                 }
-                log.Add((done ? "√ " : "× ") + it.Title + sb.ToString());
+
+                if (allDone)
+                {
+                    if (anyReal) { log.Add("√ " + it.Title + sb.ToString()); nDone++; }
+                    else { log.Add("= " + it.Title + sb.ToString()); nDefault++; }
+                }
+                else { log.Add("× " + it.Title + sb.ToString()); nTodo++; }
             }
             log.Add("");
+            log.Add("合计：" + all.Count + " 项，已达标 " + nDone + " 项，默认即达标 " + nDefault
+                    + " 项，需要处理 " + nTodo + " 项。");
             log.Add("管理员权限：" + (PrinterSystem.IsAdmin() ? "有" : "没有（改注册表/防火墙会失败）"));
             log.Add("进程完整性：" + PrinterSystem.IntegrityText());
             return log;
