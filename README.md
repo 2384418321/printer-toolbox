@@ -32,8 +32,49 @@ Windows 自带的「疑难解答」修不好这类问题，因为它不知道队
 - **刷新队列**：重新枚举本机队列（会重置选中状态）。
 - **绑定所选 →**：自动配不上（或配错了）时，手动把左边某个队列绑到右边某台设备。
 - **设为默认 / 打印测试页 / 删除队列 / 添加打印机 / 使用说明**
+- **打印测试页**：走 Windows 队列（spooler → 端口 → 设备），验证整条链路。
+- **IPP 直发**：绕开 Windows 队列，先问设备「你支持哪些文档格式」，再按格式把测试页直接交给设备（IPP `Print-Job` 到 631 端口）。见下面「Windows 说打印成功但不出纸」。
 
 扫描范围默认留空 = 扫本机所有网段；也可以填 `192.168.1.0/24` 或 `192.168.10.1-60` 这种区间。
+
+右栏多一列「**支持格式**」：设备自报的 `document-format-supported`。显示「未探测」说明 IPP 没问到，显示「设备未上报」说明设备拒答。**如果这一列里没有 `application/pdf`，那么用 Microsoft IPP 类驱动建的队列大概率打不出纸**（原因见下）。
+
+### Windows 说打印成功但不出纸
+
+这不是网络问题，是**格式问题**，2026-11 在一台 HP 一体机上定位过全过程：
+
+1. Windows 的 `Microsoft IPP Class Driver` 配在标准 TCP/IP 端口（RAW 9100）上时，渲染产物是**原始 PDF**，裸推给端口（抓包实测 236,908 字节，文件头 `%PDF-1.7`）。
+2. 有些喷墨一体机的 `document-format-supported` 里**没有 `application/pdf`**（只有 `image/pwg-raster`、`image/urf`、`image/jpeg`、`application/PCLm` 之类）。这类设备收到 PDF 会静默丢弃。
+3. spooler 那边毫无异常：事件日志照样记 `id=307 … 打印页数: 1`，队列照样 `Normal`。于是「电脑提示成功、打印机不出纸」。
+4. 换 HP 的通用驱动也一样：它发的是 PJL+PCL，可设备的语言白名单里同样没有 PCL6/PCLXL。
+
+要判断一台设备是不是这种情况，用 `--ipp-test <IP>` 无头自检（无需桌面、无需管理员）：
+
+```
+PrinterToolbox.exe --ipp-test 192.168.1.100
+```
+
+**默认只探测、不打印。** 它会打印设备身份、`printer-state`、`printer-state-reasons`、支持的格式列表，以及「这台设备能不能被 Windows 队列正常打印」的结论，然后退出——不会出纸。
+
+确认要真的打一张验证「纸上确实有字」时，才加 `--send`（会消耗 1 张纸）：
+
+```
+PrinterToolbox.exe --ipp-test 192.168.1.100 --send
+```
+
+界面上的「IPP 直发」按钮同理：点击后先问「真打 / 只看预览」，选「否」时只生成本地预览图并用系统看图工具打开，不耗纸。测试页本身也刻意做得很小（只有顶部几行短字，其余留白），一行小字就足以证明通道通。
+
+**判据**：Windows 事件 `id=307` 只代表 spooler 把数据写进了端口，不代表出纸。真正可信的判据是设备自己的页数计数器 —— 走 9100 发一句 `@PJL INFO PAGECOUNT`：
+
+```
+PrinterToolbox.exe --ipp-test 192.168.1.100 --send   # 发之前取 @PJL INFO PAGECOUNT
+# … 等 20~30 秒，再取一次 @PJL INFO PAGECOUNT
+PrinterToolbox.exe --ipp-test 192.168.1.100 --send   # 再发一次，看是否递增
+```
+
+实测这台设备三次直发把页数从 9280 推到 9282，而同期 `id=307` 记了「已打印 1 页」的 Windows 队列一页都没出。
+
+> 会话里踩过的坑：`Add-PrinterPort -Name 'http://ip/ipp/print' -PrinterHostAddress ip` **不会**建出真正的 IPP 端口，它仍然是一个 `MSFT_TcpIpPrinterPort`（`TCPMON.DLL`、9100、RAW），URL 只是端口名。只有 `Add-Printer -PortName <url>` 或 `printui /if` 那类路径才会生成 `Internet Port`，而实测这些通道对本例设备同样 delta=0。所以「换个端口形态」不能替代「换对文档格式」。
 
 ### ② 添加打印机（对话框，从 ① 页的按钮进）
 

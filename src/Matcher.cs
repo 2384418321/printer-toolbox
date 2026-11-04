@@ -83,6 +83,15 @@ namespace PrinterIpFix
             List<string> dModel = new List<string>();
             List<string> dName = new List<string>();
 
+            // 发现型端口（WSD / IPP）不靠地址、靠设备身份绑定：
+            // 这类端口的注册表里记着设备的 printer-uuid，而设备自己也会上报
+            // printer-uuid。两边对得上就是同一台机器，这是比任何名字比对都硬的证据。
+            // 少这一步的后果：WSD 队列没有 RawAddress，拿不到「同地址 +100」，
+            // 只剩型号/名字重叠的 25 分，达不到自动匹配阈值 45，界面显示「低分候选 25」。
+            string portUuid = "";
+            if (p.Kind == PortKind.Wsd || p.Kind == PortKind.TcpIp)
+                portUuid = IpRebind.PortUuid(p.PortName);
+
             foreach (DeviceInfo d in devices)
             {
                 var c = new MatchCandidate();
@@ -104,6 +113,18 @@ namespace PrinterIpFix
                     c.Reason = string.Join("；", reasons.ToArray());
                     result.Add(c);
                     continue;
+                }
+
+                // 端口里记的设备 UUID == 设备上报的 UUID —— 发现型端口的最强证据
+                if (portUuid.Length >= 8 && !string.IsNullOrEmpty(d.Uuid))
+                {
+                    string a = IpRebind.NormalizeUuid(portUuid).ToLowerInvariant();
+                    string b = IpRebind.NormalizeUuid(d.Uuid).ToLowerInvariant();
+                    if (a.Length >= 8 && a == b)
+                    {
+                        score += 100;
+                        reasons.Add("端口 UUID 就是这台设备");
+                    }
                 }
 
                 // 序列号出现在队列名或端口名里 —— 最强证据

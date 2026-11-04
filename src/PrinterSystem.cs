@@ -68,26 +68,148 @@ namespace PrinterIpFix
                         var pi = new PortInfo();
                         pi.Name = Str(mo["Name"]);
                         pi.HostAddress = Str(mo["HostAddress"]).Trim();
-                        // 兜底：WMI 的 HostAddress 偶发为空（实测 IP_192.168.1.100 就是这样），
-                        // 此时从端口名的 IP_<地址> 形式里把地址抠出来，否则整个匹配链会断。
-                        if (pi.HostAddress.Length == 0 && pi.Name.StartsWith("IP_", StringComparison.OrdinalIgnoreCase))
-                        {
-                            string guess = pi.Name.Substring(3);
-                            IPAddress parsed;
-                            if (IPAddress.TryParse(guess, out parsed) && parsed.AddressFamily == AddressFamily.InterNetwork)
-                                pi.HostAddress = guess;
-                        }
+                        // WMI 的 HostAddress 在 Win11 上常为 null（实测本机 7 条 TCP/IP 端口
+                        // 全是 null，但 Get-WmiObject 单条查又有值）。真正权威的地址在注册表
+                        // Standard TCP/IP Port 的 HostName 里，且 WMI 写入也是落到那里。
+                        // 顺序：WMI → 注册表 HostName → 从端口名猜（最后兜底，猜出来可能是旧的）。
+                        if (pi.HostAddress.Length == 0)
+                            pi.HostAddress = StandardPortHost(pi.Name);
+                        if (pi.HostAddress.Length == 0)
+                            pi.HostAddress = GuessHostFromPortName(pi.Name);
                         object pn = mo["PortNumber"];
                         pi.PortNumber = (pn == null) ? 9100 : Convert.ToInt32(pn);
                         object pr = mo["Protocol"];
                         pi.Protocol = (pr == null) ? 1 : Convert.ToInt32(pr);
                         pi.SnmpEnabled = Bool(mo["SNMPEnabled"]);
                         pi.IsTcp = true;
-                        if (pi.Name.Length > 0) d[pi.Name] = pi;
+                        if (pi.Name.Length > 0)
+                        {
+                            // 端口的 Name 并不唯一：一个 URL 形态的端口会同时存在
+                            // 「标准 TCP/IP 端口」（HostAddress 有值）与「Internet Port」（HostAddress 为空）两条同名记录。
+                            // 直接 d[name] = pi 会被后枚举到的那条覆盖 —— 实测覆盖掉的正是有地址的那条，
+                            // 于是队列地址解析成空串，界面把 IPP Fresh 判成「地址不通」。
+                            // 所以同名时一律保留「有地址」的那条。
+                            PortInfo exist;
+                            if (d.TryGetValue(pi.Name, out exist))
+                            {
+                                if (exist.HostAddress.Length > 0) continue;
+                                if (pi.HostAddress.Length == 0) continue;
+                            }
+                            d[pi.Name] = pi;
+                        }
                     }
                 }
             }
             return d;
+        }
+
+        /// <summary>
+        /// 读注册表里标准 TCP/IP 端口的真实地址（HostName / IPAddress）。
+        /// 这是改地址后立刻能读到的权威值：WMI 的 HostAddress 会返回 null，
+        /// 而 Put() 写入的正是这里，所以校准必须读这一处，否则永远看不出地址被改过。
+        /// 读不到返回空串。
+        /// </summary>
+        public static string StandardPortHost(string portName)
+        {
+            if (portName == null || portName.Length == 0) return "";
+            string key = @"SYSTEM\CurrentControlSet\Control\Print\Monitors\Standard TCP/IP Port\Ports\" + portName;
+            try
+            {
+                using (Microsoft.Win32.RegistryKey k = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(key))
+                {
+                    if (k == null) return "";
+                    object h = k.GetValue("HostName");
+                    string host = (h == null) ? "" : h.ToString().Trim();
+                    if (host.Length > 0) return host;
+                    object ip = k.GetValue("IPAddress");
+                    return (ip == null) ? "" : ip.ToString().Trim();
+                }
+            }
+            catch { return ""; }
+        }
+
+        /// <summary>
+        /// WMI 的 HostAddress 为空时，从端口名里猜设备地址。
+        /// 支持的端口名形态：
+        ///   IP_192.168.1.100            （本工具自己建的）
+        ///   http://192.168.1.100/ipp/print
+        ///   http://192.168.1.100:631/ipp/print
+        ///   https://host/ipp/print
+        ///   IP_hostname / 其它含主机名的名字
+        /// 猜不到返回空串（调用方按「地址不通」处理，不会误报可达）。
+        /// </summary>
+        private static string GuessHostFromPortName(string portName)
+        {
+            if (portName == null) return "";
+            string n = portName.Trim();
+            if (n.Length == 0) return "";
+
+            // 形态一：IP_<addr>
+            if (n.StartsWith("IP_", StringComparison.OrdinalIgnoreCase))
+                return FirstIpv4OrEmpty(n.Substring(3));
+
+            // 形态二：URL（http/https 开头）——取主机名部分
+            string lower = n.ToLowerInvariant();
+            if (lower.StartsWith("http://") || lower.StartsWith("https://"))
+            {
+                int from = n.IndexOf("://", StringComparison.Ordinal) + 3;
+                int to = n.Length;
+                int slash = n.IndexOf('/', from);
+                if (slash >= 0) to = slash;
+                string hostPart = n.Substring(from, to - from);
+                int colon = hostPart.IndexOf(':');
+                if (colon >= 0) hostPart = hostPart.Substring(0, colon);   // 剥端口
+                return FirstIpv4OrEmpty(hostPart);
+            }
+
+            // 形态三：名字里嵌着 IPv4（如 CAP_127.0.0.1_9101）
+            string embedded = FirstIpv4OrEmpty(n);
+            if (embedded.Length > 0) return embedded;
+
+            return "";
+        }
+
+        /// <summary>
+        /// 从一段文本里抠出第一个 IPv4 字面量；文本本身是合法 IPv4 就原样返回。
+        /// 用于端口名/URL 里取地址，避免把 hostname 当 IP 用。
+        /// </summary>
+        private static string FirstIpv4OrEmpty(string s)
+        {
+            if (s == null || s.Length == 0) return "";
+            string t = s.Trim();
+            IPAddress direct;
+            if (IPAddress.TryParse(t, out direct) && direct.AddressFamily == AddressFamily.InterNetwork)
+                return t;
+
+            // 允许 "127.0.0.1_9101" 这种被符号包住的写法
+            int start = -1;
+            for (int i = 0; i < t.Length; i++)
+            {
+                if (char.IsDigit(t[i]))
+                {
+                    if (start < 0) start = i;
+                }
+                else if (t[i] == '.' && start >= 0) { /* 继续 */ }
+                else
+                {
+                    if (start >= 0)
+                    {
+                        string cand = t.Substring(start, i - start);
+                        IPAddress a;
+                        if (IPAddress.TryParse(cand, out a) && a.AddressFamily == AddressFamily.InterNetwork)
+                            return cand;
+                        start = -1;
+                    }
+                }
+            }
+            if (start >= 0)
+            {
+                string cand2 = t.Substring(start);
+                IPAddress a2;
+                if (IPAddress.TryParse(cand2, out a2) && a2.AddressFamily == AddressFamily.InterNetwork)
+                    return cand2;
+            }
+            return "";
         }
 
         /// <summary>判断端口类别并解析地址</summary>

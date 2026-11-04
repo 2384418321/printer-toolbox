@@ -17,6 +17,7 @@ namespace PrinterIpFix
         public string Inf;         // INF 文件名或发布名
         public string InfPath;     // 本地可用的 INF 绝对路径（没有则为空）
         public string Source;      // 来源：队列驱动 / 驱动库数据库 / 本地驱动文件夹
+        public List<string> Models = new List<string>();   // INF 里声明的型号列表（匹配的最硬证据）
 
         public override string ToString()
         {
@@ -125,7 +126,13 @@ namespace PrinterIpFix
                     if (maj.Length > 0 || min.Length > 0)
                         e.Version = (maj.Length > 0 ? maj : "0") + "." + (min.Length > 0 ? min : "0");
                     e.InfPath = f.Length > 4 ? f[4] : "";
-                    if (e.InfPath != null && e.InfPath.Length > 0) e.Inf = Path.GetFileName(e.InfPath);
+                    if (e.InfPath != null && e.InfPath.Length > 0)
+                    {
+                        e.Inf = Path.GetFileName(e.InfPath);
+                        // 关键：通用驱动的名字里没有型号，型号只在 INF 里。
+                        // 不读这一步，Match 就永远匹配不到 HP Smart Universal Printing。
+                        try { e.Models = InfModels(e.InfPath); } catch { }
+                    }
                     e.Source = "队列在用";
                     AddOrMerge(all, e);
                     got++;
@@ -243,6 +250,10 @@ namespace PrinterIpFix
                     e.Version = S(mo["DriverVersion"]);
                     e.Inf = S(mo["InfName"]);
                     e.InfPath = ResolveInfPath(e.Inf);
+                    if (e.InfPath.Length > 0)
+                    {
+                        try { e.Models = InfModels(e.InfPath); } catch { }
+                    }
                     e.Source = "系统驱动库";
                     AddOrMerge(all, e);
                 }
@@ -295,6 +306,7 @@ namespace PrinterIpFix
                         e0.Version = ver;
                         e0.Inf = Path.GetFileName(files[i]);
                         e0.InfPath = files[i];
+                        e0.Models = models;
                         e0.Source = "本地驱动包";
                         AddOrMerge(all, e0);
                         continue;
@@ -307,6 +319,7 @@ namespace PrinterIpFix
                         e.Version = ver;
                         e.Inf = Path.GetFileName(files[i]);
                         e.InfPath = files[i];
+                        e.Models = models;
                         e.Source = "本地驱动包";
                         AddOrMerge(all, e);
                     }
@@ -324,6 +337,20 @@ namespace PrinterIpFix
                 if (all[i].InfPath.Length == 0 && e.InfPath.Length > 0) all[i].InfPath = e.InfPath;
                 if (all[i].Provider.Length == 0 && e.Provider.Length > 0) all[i].Provider = e.Provider;
                 if (all[i].Version.Length == 0 && e.Version.Length > 0) all[i].Version = e.Version;
+                // 型号表必须合并：同一条驱动会从「队列在用」「系统驱动库」两个源各来一次，
+                // 先到的可能没有 INF 路径因而没有型号表；只补 InfPath 不补 Models 会让匹配永远失败。
+                if (e.Models != null && e.Models.Count > 0)
+                {
+                    if (all[i].Models == null) all[i].Models = new List<string>();
+                    for (int k = 0; k < e.Models.Count; k++)
+                    {
+                        string m = e.Models[k];
+                        bool dup = false;
+                        for (int j = 0; j < all[i].Models.Count; j++)
+                            if (string.Compare(all[i].Models[j], m, StringComparison.OrdinalIgnoreCase) == 0) { dup = true; break; }
+                        if (!dup) all[i].Models.Add(m);
+                    }
+                }
                 return;
             }
             all.Add(e);
@@ -378,40 +405,186 @@ namespace PrinterIpFix
             return "";
         }
 
+        /// <summary>
+        /// 从 INF 里提取「这台驱动支持哪些型号」。
+        ///
+        /// 为什么不能只读 [Manufacturer] 段：真实 INF 的 [Manufacturer] 通常只有一行
+        /// `%OEM% = OEM,NTamd64`，真正的型号表在它指向的子段 [OEM.NTamd64] 里；
+        /// 而且 HP 这类万能驱动的每条目左边一律是 `%HPODPRINTERS%`（同一个显示名），
+        /// **型号藏在右边的硬件 ID**（`MF\OfficeJet_Pro_9730_Series&amp;WSD&amp;IP_PRINT`）。
+        /// 只读左边会得到一堆 `%OEM%`，等于没有信息 —— 这就是「驱动匹配不上」的根因。
+        ///
+        /// 所以这里做三件事：①顺着 Manufacturer 段找子段；②用 [Strings] 解析 %KEY%；
+        /// ③把每条的左边（字面型号）和右边的硬件 ID（去掉 MF\、&amp;WSD 之类修饰）都当候选型号。
+        /// </summary>
         private static List<string> InfModels(string path)
         {
             List<string> models = new List<string>();
             string[] lines = ReadLines(path);
-            bool inModels = false;
+            if (lines.Length == 0) return models;
+
+            // ---- 第一遍：收集 [Strings] 与 [Manufacturer] 指向的子段名 ----
+            var strings = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var modelSections = new List<string>();
+            bool inStrings = false, inManu = false;
+
             for (int i = 0; i < lines.Length; i++)
             {
-                string raw = lines[i];
-                string t = raw.Trim();
-                if (t.Length == 0) continue;
+                string t = lines[i].Trim();
+                if (t.Length == 0 || t[0] == ';') continue;
+
                 if (t[0] == '[')
                 {
-                    inModels = t.StartsWith("[Manufacturer]", StringComparison.OrdinalIgnoreCase)
-                            || t.StartsWith("[Models]", StringComparison.OrdinalIgnoreCase);
+                    int close = t.IndexOf(']');
+                    string sec = close > 0 ? t.Substring(1, close - 1).Trim() : t.Substring(1).Trim();
+                    inStrings = string.Compare(sec, "Strings", StringComparison.OrdinalIgnoreCase) == 0;
+                    inManu = string.Compare(sec, "Manufacturer", StringComparison.OrdinalIgnoreCase) == 0;
+                    // 名字里带 Models 的段直接当型号段（老式 INF 常见）
+                    if (!inStrings && !inManu && sec.IndexOf("Models", StringComparison.OrdinalIgnoreCase) >= 0)
+                        AddUnique(modelSections, sec);
                     continue;
                 }
-                if (!inModels) continue;
-                if (t[0] == ';') continue;
 
                 int eq = t.IndexOf('=');
                 if (eq <= 0) continue;
                 string left = t.Substring(0, eq).Trim();
-                left = left.Replace("\"", "").Trim();
-                if (left.Length < 3) continue;
-                if (left.IndexOf('\\') >= 0) continue;
-                if (Regex.IsMatch(left, "^[A-Za-z0-9_]+$") && left.IndexOf(' ') < 0) continue;
+                string right = t.Substring(eq + 1).Trim();
 
-                bool dup = false;
-                for (int j = 0; j < models.Count; j++)
-                    if (string.Compare(models[j], left, StringComparison.OrdinalIgnoreCase) == 0) { dup = true; break; }
-                if (!dup) models.Add(left);
-                if (models.Count >= 60) break;   // 万能驱动包的 INF 能有几千行，够用了
+                if (inStrings)
+                {
+                    if (left.Length > 0)
+                    {
+                        string v = right.Replace("\"", "").Trim();
+                        strings[left] = v;
+                    }
+                }
+                else if (inManu)
+                {
+                    // %Provider% = ModelsSection,Decoration  →  真实段名 ModelsSection.Decoration
+                    string secPart = right;
+                    int comma = secPart.IndexOf(',');
+                    string deco = "";
+                    if (comma >= 0) { deco = secPart.Substring(comma + 1).Trim(); secPart = secPart.Substring(0, comma).Trim(); }
+                    string real = deco.Length > 0 ? secPart + "." + deco : secPart;
+                    if (real.Length > 0) AddUnique(modelSections, real);
+                    // 有的 INF 不写修饰（如 `%X% = OEM`），两种都登记
+                    if (secPart.Length > 0) AddUnique(modelSections, secPart);
+                }
             }
+
+            // 一个子段都没找到就退回「所有像型号段的段」，别啥也不给
+            if (modelSections.Count == 0)
+            {
+                for (int i = 0; i < lines.Length; i++)
+                {
+                    string t = lines[i].Trim();
+                    if (t.Length > 2 && t[0] == '[')
+                    {
+                        int close = t.IndexOf(']');
+                        string sec = close > 0 ? t.Substring(1, close - 1).Trim() : "";
+                        if (sec.IndexOf("OEM", StringComparison.OrdinalIgnoreCase) >= 0
+                         || sec.IndexOf("Models", StringComparison.OrdinalIgnoreCase) >= 0)
+                            AddUnique(modelSections, sec);
+                    }
+                }
+            }
+
+            // ---- 第二遍：读每个型号段 ——---
+            for (int s = 0; s < modelSections.Count; s++)
+            {
+                string want = modelSections[s];
+                bool inSection = false;
+                for (int i = 0; i < lines.Length; i++)
+                {
+                    string t = lines[i].Trim();
+                    if (t.Length == 0 || t[0] == ';') continue;
+                    if (t[0] == '[')
+                    {
+                        int close = t.IndexOf(']');
+                        string sec = close > 0 ? t.Substring(1, close - 1).Trim() : t.Substring(1).Trim();
+                        inSection = string.Compare(sec, want, StringComparison.OrdinalIgnoreCase) == 0;
+                        continue;
+                    }
+                    if (!inSection) continue;
+
+                    int eq = t.IndexOf('=');
+                    if (eq <= 0) continue;
+                    string left = t.Substring(0, eq).Trim();
+                    string right = t.Substring(eq + 1).Trim();
+
+                    // ① 左边：字面型号，或者 %KEY% 去 [Strings] 里查
+                    if (left.Length > 0)
+                    {
+                        string name = left;
+                        if (name.StartsWith("%") && name.EndsWith("%") && name.Length > 2)
+                        {
+                            string key = name.Substring(1, name.Length - 2);
+                            string val;
+                            if (strings.TryGetValue(key, out val)) name = val;
+                            else name = "";   // 解析不出来就当没有，别把 %OEM% 当型号
+                        }
+                        name = name.Replace("\"", "").Trim();
+                        if (name.Length >= 3 && name.IndexOf('\\') < 0) AddUnique(models, name);
+                    }
+
+                    // ② 右边：InstallSection,HardwareID  —— 硬件 ID 才是真正的型号来源
+                    int comma = right.IndexOf(',');
+                    if (comma >= 0)
+                    {
+                        string hwid = right.Substring(comma + 1).Trim();
+                        while (true)
+                        {
+                            int next = hwid.IndexOf(',');
+                            if (next < 0) break;
+                            // 只取第一个硬件 ID（后面的是兼容 ID，噪声大）
+                            hwid = hwid.Substring(0, next).Trim();
+                            break;
+                        }
+                        string pretty = PrettyHardwareId(hwid);
+                        if (pretty.Length >= 3) AddUnique(models, pretty);
+                    }
+
+                    if (models.Count >= 400) break;   // 万能驱动包能有几百上千条，够用了
+                }
+                if (models.Count >= 400) break;
+            }
+
             return models;
+        }
+
+        /// <summary>
+        /// 把硬件 ID 变成人看得懂、可比对的型号：
+        ///   MF\OfficeJet_Pro_9730_Series&amp;WSD&amp;IP_PRINT   →  OfficeJet Pro 9730 Series
+        ///   WSDPRINT\HPHP_Color_LaserJet_2A33                 →  HPHP Color LaserJet 2A33
+        /// </summary>
+        private static string PrettyHardwareId(string hwid)
+        {
+            if (hwid == null) return "";
+            string s = hwid.Trim();
+            if (s.Length == 0) return "";
+
+            // 去掉总线前缀（MF\ / PRINT\ / WSDPRINT\ / USBPRINT\ ...）
+            int slash = s.IndexOf('\\');
+            if (slash >= 0) s = s.Substring(slash + 1);
+
+            // 去掉 &WSD &IP_PRINT &REV_xxx 之类的修饰
+            int amp = s.IndexOf('&');
+            if (amp > 0) s = s.Substring(0, amp);
+
+            // 下划线/连字符变空格；连续的动词收起
+            s = s.Replace('_', ' ').Replace('-', ' ').Trim();
+            while (s.IndexOf("  ") >= 0) s = s.Replace("  ", " ");
+            return s;
+        }
+
+        private static void AddUnique(List<string> list, string v)
+        {
+            if (v == null) return;
+            string t = v.Trim();
+            if (t.Length == 0) return;
+            for (int i = 0; i < list.Count; i++)
+                if (string.Compare(list[i], t, StringComparison.OrdinalIgnoreCase) == 0) return;
+            list.Add(t);
         }
 
         // ---------------- 匹配 ----------------
@@ -459,36 +632,72 @@ namespace PrinterIpFix
 
             for (int i = 0; i < drivers.Count; i++)
             {
-                List<string> dt = Tokens(drivers[i].Name);
-                if (dt.Count == 0) continue;
-
-                int score = 0;
-                for (int a = 0; a < mt.Count; a++)
-                {
-                    for (int b = 0; b < dt.Count; b++)
-                    {
-                        if (mt[a] == dt[b]) { score += Regex.IsMatch(mt[a], "[0-9]") ? 45 : 20; break; }
-                        if (mt[a].Length >= 4 && dt[b].Length >= 4 &&
-                            (mt[a].IndexOf(dt[b], StringComparison.Ordinal) >= 0 ||
-                             dt[b].IndexOf(mt[a], StringComparison.Ordinal) >= 0))
-                        { score += 10; break; }
-                    }
-                }
-                // 厂商一致再加一点
-                string prov = drivers[i].Provider;
-                if (prov.Length > 0)
-                {
-                    string p = prov.ToUpperInvariant();
-                    for (int a = 0; a < mt.Count; a++)
-                        if (mt[a].Length >= 2 && p.IndexOf(mt[a], StringComparison.Ordinal) >= 0) { score += 12; break; }
-                }
-                // 本地驱动包优先级略高（能直接装）
-                if (drivers[i].InfPath != null && drivers[i].InfPath.Length > 0) score += 3;
-
+                int score = ScoreOne(mt, drivers[i]);
                 if (score > bestScore) { bestScore = score; best = drivers[i]; }
             }
 
             return bestScore >= 40 ? best : null;
+        }
+
+        /// <summary>
+        /// 给一条驱动打分。**关键是同时看两个证据源**：
+        ///   ① 驱动名（Name）—— 老驱动常把型号写进名字，如 "HP OfficeJet Pro 9720 Series"；
+        ///   ② INF 里声明的型号表（Models）—— 新的通用/一体驱动名字里根本不含型号
+        ///      （实测本机 HP 只有 "HP Smart Universal Printing"，而它的 INF 里
+        ///      明明列着 OfficeJet Pro 9730），只比名字必然匹配不到。
+        /// </summary>
+        private static int ScoreOne(List<string> mt, DriverEntry d)
+        {
+            int score = 0;
+
+            // 证据①：驱动名
+            List<string> dt = Tokens(d.Name);
+            score += TokenScore(mt, dt);
+
+            // 证据②：INF 型号表（命中即视为「厂商自己声明支持这台机」，最硬）
+            if (d.Models != null)
+            {
+                for (int i = 0; i < d.Models.Count; i++)
+                {
+                    List<string> im = Tokens(d.Models[i]);
+                    int s = TokenScore(mt, im);
+                    // 型号表命中比驱动名更可信，加权 1.4 倍后取上限
+                    int weighted = (int)(s * 1.4);
+                    if (weighted > score) score = weighted;
+                }
+            }
+
+            // 厂商一致再加一点
+            string prov = d.Provider;
+            if (prov.Length > 0)
+            {
+                string p = prov.ToUpperInvariant();
+                for (int a = 0; a < mt.Count; a++)
+                    if (mt[a].Length >= 2 && p.IndexOf(mt[a], StringComparison.Ordinal) >= 0) { score += 12; break; }
+            }
+            // 本地驱动包优先级略高（能直接装）
+            if (d.InfPath != null && d.InfPath.Length > 0) score += 3;
+
+            return score;
+        }
+
+        /// <summary>两组 token 的重合分：数字主干相等最硬，纯字母相等次之，包含关系再次。</summary>
+        private static int TokenScore(List<string> mt, List<string> dt)
+        {
+            int score = 0;
+            if (mt == null || dt == null) return 0;
+            for (int a = 0; a < mt.Count; a++)
+            {
+                for (int b = 0; b < dt.Count; b++)
+                {
+                    if (mt[a] == dt[b]) { score += Regex.IsMatch(mt[a], "[0-9]") ? 45 : 20; break; }
+                    if (mt[a].Length >= 4 && dt[b].Length >= 4 &&
+                        (mt[a].IndexOf(dt[b], StringComparison.Ordinal) >= 0 ||
+                         dt[b].IndexOf(mt[a], StringComparison.Ordinal) >= 0))
+                    { score += 10; break; }
+                }
+            }
+            return score;
         }
 
         /// <summary>没有精确驱动时的兜底：同厂商的通用/万能驱动。</summary>

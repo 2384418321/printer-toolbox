@@ -935,20 +935,75 @@ namespace PrinterIpFix
             string port = txtPort.Text.Trim();
             if (port.Length == 0) port = MakePortName(ip);
 
-            if (PrinterSystem.PortExists(port))
+            // 建端口之前先问设备：叫什么、支持哪些文档格式、UUID 是多少。这一步是必要的：
+            // 标准 TCP/IP 端口（RAW 9100）只能把文档原样推给设备，而 Windows 的
+            // Microsoft IPP Class Driver 在 RAW 端口上渲染出来的是 PDF。设备不支持 PDF 时
+            // 会把作业静默丢掉，spooler 却照样报「打印成功、1 页」—— 这就是「电脑说打完了、
+            // 打印机没动静」的根子。所以：先探测；如果本机已经有这台设备的发现型端口
+            // （WSD / IPP，按 printer-uuid 认），就直接复用它，别再造一条 RAW 假队列。
+            DeviceInfo probe = new DeviceInfo();
+            probe.Ip = ip;
+            try { Ipp.Probe(probe, 6000); }
+            catch (Exception ex) { AppendLog("探测设备失败：" + ex.Message); }
+
+            if (probe.FormatsProbed && probe.Formats.Length > 0)
             {
-                AppendLog("端口已存在，直接复用：" + port);
+                AppendLog("设备名称：" + (probe.IppName.Length > 0 ? probe.IppName : "-")
+                    + "    型号：" + (probe.Model.Length > 0 ? probe.Model : "-"));
+                AppendLog("设备支持的文档格式：" + probe.Formats);
+                if (!probe.SupportsPdf)
+                {
+                    AppendLog("⚠ 这台设备不接收 PDF。用 Microsoft IPP Class Driver + 标准 TCP/IP 端口（RAW 9100）"
+                        + "建出来的队列，会出现「电脑提示打印成功、打印机不出纸」。");
+                }
             }
             else
             {
-                AppendLog("新建端口 " + port + " → " + ip + ":9100");
-                bool okPort = PrinterSystem.CreateTcpPort(port, ip, 9100);
-                for (int i = 0; i < PrinterSystem.LastPortLog.Count; i++)
-                    AppendLog("  " + PrinterSystem.LastPortLog[i]);
-                if (!okPort && !PrinterSystem.PortExists(port))
+                AppendLog("设备没有回应格式列表（" + Ipp.LastNote + "）。按常规建端口，若不出纸请用『IPP 直发』复查。");
+            }
+
+            // 关键一步：设备不收 PDF 时，优先复用本机已有的发现型端口。
+            // 发现型端口（WSD / IPP）按设备身份绑定，会跟设备协商格式，是唯一能真出纸的
+            // Windows 通道；RAW 9100 对这类设备只会造假成功。
+            string reusePort = "";
+            if (probe.FormatsProbed && !probe.SupportsPdf && probe.Uuid.Length > 0)
+            {
+                try { reusePort = IpRebind.FindWsdPort(probe.Uuid); }
+                catch (Exception ex) { AppendLog("查找发现型端口失败：" + ex.Message); }
+                if (reusePort.Length > 0)
                 {
-                    AppendLog("端口没建成。若日志是拒绝访问，用『以管理员身份运行』再试一次。");
-                    return false;
+                    AppendLog("本机已经有这台设备的发现型端口：" + reusePort + "  —— 复用它，不建 RAW 9100 端口。");
+                    port = reusePort;
+                }
+                else
+                {
+                    AppendLog("本机还没有这台设备的发现型端口。");
+                    AppendLog("建议：先在系统「设置 → 蓝牙和其他设备 → 打印机和扫描仪 → 添加打印机」"
+                        + "让 Windows 自己发现并添加这台设备（那条走 IPP 协商，能正常出纸）；"
+                        + "或者直接用本工具主界面的『IPP 直发』把文件送过去。");
+                    AppendLog("如果仍要继续用标准 TCP/IP 端口，请改选打印机厂商的完整驱动（不要用 Microsoft IPP Class Driver），"
+                        + "否则大概率还是不出纸。");
+                }
+            }
+
+            bool needPort = (reusePort.Length == 0);
+            if (needPort)
+            {
+                if (PrinterSystem.PortExists(port))
+                {
+                    AppendLog("端口已存在，直接复用：" + port);
+                }
+                else
+                {
+                    AppendLog("新建端口 " + port + " → " + ip + ":9100");
+                    bool okPort = PrinterSystem.CreateTcpPort(port, ip, 9100);
+                    for (int i = 0; i < PrinterSystem.LastPortLog.Count; i++)
+                        AppendLog("  " + PrinterSystem.LastPortLog[i]);
+                    if (!okPort && !PrinterSystem.PortExists(port))
+                    {
+                        AppendLog("端口没建成。若日志是拒绝访问，用『以管理员身份运行』再试一次。");
+                        return false;
+                    }
                 }
             }
 
@@ -956,6 +1011,12 @@ namespace PrinterIpFix
             bool ok = PrinterSystem.CreateQueue(name, driver, port, out err);
             for (int i = 0; i < PrinterSystem.LastAddLog.Count; i++) AppendLog("  " + PrinterSystem.LastAddLog[i]);
             AppendLog(err);
+            if (ok)
+            {
+                // 记进绑定表，以后设备换 IP 时「校准IP」能按身份认回来。
+                try { IpRebind.Remember(name, probe, port); }
+                catch { }
+            }
             return ok;
         }
 

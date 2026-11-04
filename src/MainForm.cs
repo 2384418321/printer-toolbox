@@ -30,11 +30,13 @@ namespace PrinterIpFix
         private Button btnBind;
         private Button btnDefault;
         private Button btnTest;
+        private Button btnIppTest;
         private Button btnRefresh;
         private Button btnReprobe;
         private Button btnDelete;
         private Button btnAddPrinter;
         private Button btnHelp;
+        private Button btnCalibrate;
         private Label lblPrinterHint;
         private Label lblDeviceHint;
 
@@ -44,6 +46,20 @@ namespace PrinterIpFix
         private int _scanTotal;
         private int _scanDone;
         private int _foundCount;
+
+        // 探测单飞守卫：端口探测每轮可能要好几秒（死地址要重试），
+        // 没有这个标志时连点「重新探测」/多次触发会让后台线程叠加，
+        // 日志里就会出现一秒一行成对刷屏。
+        private volatile bool _probeRunning;
+        private volatile bool _ippSending;
+        // 校准单飞守卫（校准会扫网，不能叠加）
+        private volatile bool _calibrating;
+        // 删除单飞守卫：删队列要走 WMI + spooler + 最多四条路线，
+        // 每条路线后面都跟 WaitGone（3~4 秒），一台就可能十几秒。
+        // 放在主线程同步跑就会「点删除后界面卡死」，所以挪到后台线程。
+        private volatile bool _deleting;
+        // 上一次「自动匹配完成」时报的台数，用来避免每次都重复同一句。
+        private int _lastMatched = -1;
 
         public MainForm()
         {
@@ -79,43 +95,54 @@ namespace PrinterIpFix
             btnRow.WrapContents = false;
             btnRow.Padding = new Padding(0, 2, 0, 4);
 
-            btnAuto = MakeButton("自动匹配并修复", 120);
+            btnAuto = MakeButton("自动匹配并修复", 100);
             btnAuto.Click += delegate { OnAutoFix(); };
 
-            btnBind = MakeButton("绑定所选 →", 100);
+            btnBind = MakeButton("绑定所选 →", 78);
             btnBind.Click += delegate { OnBind(); };
 
-            btnDefault = MakeButton("设为默认", 88);
+            btnDefault = MakeButton("设为默认", 70);
             btnDefault.Click += delegate { OnSetDefault(); };
 
-            btnTest = MakeButton("打印测试页", 100);
+            btnTest = MakeButton("打印测试页", 80);
             btnTest.Click += delegate { OnTestPage(); };
 
+            // IPP 直发：绕过 Windows 队列，按设备真正支持的格式把测试页交过去。
+            // 有些机器不支持 PDF，Windows 队列会「提示成功但不出纸」，这条通道才通。
+            btnIppTest = MakeButton("IPP 直发", 74);
+            btnIppTest.Click += delegate { OnIppTestPage(); };
+
             // 重新探测：只重测现有队列的端口地址，不重读队列列表（保留当前选中与已匹配结果）。
-            btnReprobe = MakeButton("重新探测", 88);
+            btnReprobe = MakeButton("重新探测", 70);
             btnReprobe.Click += delegate { StartQuickProbe(); };
 
             // 刷新队列：重新从系统枚举打印机，再探测一次（外部增删打印机后用这个）。
-            btnRefresh = MakeButton("刷新队列", 88);
+            btnRefresh = MakeButton("刷新队列", 70);
             btnRefresh.Click += delegate { ReloadPrinters(true); StartQuickProbe(); };
 
-            btnDelete = MakeButton("删除队列", 88);
+            btnDelete = MakeButton("删除队列", 70);
             btnDelete.Click += delegate { OnDelete(); };
 
-            btnAddPrinter = MakeButton("添加打印机", 88);
+            btnAddPrinter = MakeButton("添加打印机", 78);
             btnAddPrinter.Click += delegate { OnAddPrinter(); };
 
-            btnHelp = MakeButton("使用说明", 88);
+            btnHelp = MakeButton("使用说明", 70);
             btnHelp.Click += delegate { ShowHelp(); };
+
+            // 打印机重启会换 IP，这条按钮按「设备身份」把队列端口自动指回正确地址
+            btnCalibrate = MakeButton("校准IP", 78);
+            btnCalibrate.Click += delegate { OnCalibrate(); };
 
             btnRow.Controls.Add(btnAuto);
             btnRow.Controls.Add(btnBind);
             btnRow.Controls.Add(btnDefault);
             btnRow.Controls.Add(btnTest);
+            btnRow.Controls.Add(btnIppTest);
             btnRow.Controls.Add(btnDelete);
             btnRow.Controls.Add(btnAddPrinter);
             btnRow.Controls.Add(btnReprobe);
             btnRow.Controls.Add(btnRefresh);
+            btnRow.Controls.Add(btnCalibrate);
             btnRow.Controls.Add(btnHelp);
 
             txtLog = new TextBox();
@@ -225,6 +252,7 @@ namespace PrinterIpFix
             lvDevices.Columns.Add("设备名", 140);
             lvDevices.Columns.Add("型号", 150);
             lvDevices.Columns.Add("服务", 56);
+            lvDevices.Columns.Add("支持格式", 150);
             lvDevices.Resize += delegate { FitDeviceColumns(); };
             lvDevices.DoubleClick += delegate { OnBind(); };
 
@@ -278,7 +306,7 @@ namespace PrinterIpFix
 
         private void FitDeviceColumns()
         {
-            double[] fr = { 0.22, 0.26, 0.30, 0.22 };
+            double[] fr = { 0.18, 0.22, 0.25, 0.12, 0.23 };
             FitColumns(lvDevices, fr);
         }
 
@@ -364,19 +392,34 @@ namespace PrinterIpFix
         /// <summary>先只探已知地址（快），让用户立刻看到端口是不是死的</summary>
         private void StartQuickProbe()
         {
+            // 单飞：上一轮还没收尾就不要再开一轮，否则日志会被成对刷屏。
+            if (_probeRunning)
+            {
+                Log("上一次探测还没结束，稍等…");
+                return;
+            }
+            _probeRunning = true;
+
             var list = new List<PrinterInfo>(_printers);
             var th = new Thread(delegate()
             {
-                foreach (PrinterInfo p in list)
+                try
                 {
-                    if (p.Kind != PortKind.TcpIp) continue;
-                    if (string.IsNullOrEmpty(p.ResolvedIp)) { p.AddressAlive = false; p.PingAlive = false; continue; }
+                    foreach (PrinterInfo p in list)
+                    {
+                        if (p.Kind != PortKind.TcpIp) continue;
+                        if (string.IsNullOrEmpty(p.ResolvedIp)) { p.AddressAlive = false; p.PingAlive = false; continue; }
 
-                    // 深睡设备第一次连不上很正常，交给 EnsureAlive 重试
-                    bool ping;
-                    bool ok = Scanner.EnsureAlive(p.ResolvedIp, out ping);
-                    p.AddressAlive = ok;
-                    p.PingAlive = ping;
+                        // 深睡设备第一次连不上很正常，交给 EnsureAlive 重试
+                        bool ping;
+                        bool ok = Scanner.EnsureAlive(p.ResolvedIp, out ping);
+                        p.AddressAlive = ok;
+                        p.PingAlive = ping;
+                    }
+                }
+                finally
+                {
+                    _probeRunning = false;
                 }
                 Ui(delegate
                 {
@@ -499,7 +542,10 @@ namespace PrinterIpFix
                     it.SubItems.Add(d.DisplayName);
                     it.SubItems.Add(string.IsNullOrEmpty(d.Model) ? "-" : d.Model);
                     it.SubItems.Add(d.Services);
+                    it.SubItems.Add(d.FormatsText);
                     if (!string.IsNullOrEmpty(d.Error)) it.ForeColor = Color.FromArgb(150, 110, 20);
+                    else if (d.FormatsProbed && !d.SupportsPdf && d.HasIpp)
+                        it.ForeColor = Color.FromArgb(180, 90, 20);   // 不支持 PDF：Windows 队列会假成功
                     lvDevices.Items.Add(it);
                 }
             }
@@ -646,8 +692,13 @@ namespace PrinterIpFix
             FillPrinterList();
             if (verbose)
                 Log("自动匹配完成：" + matched + " 台队列锁定了设备。");
-            else if (matched > 0)
+            else if (matched > 0 && matched != _lastMatched)
+            {
+                // 只在台数变了时提示一次：探测/刷新会反复调 AutoMatch，
+                // 每次都打同一句会在日志里刷屏。
                 Log("自动匹配完成：" + matched + " 台队列锁定了设备，可点『自动匹配并修复』。");
+            }
+            _lastMatched = matched;
         }
 
         private PrinterInfo GetSelectedPrinter()
@@ -751,6 +802,61 @@ namespace PrinterIpFix
                 Log("建议下一步：选中队列点『打印测试页』，出纸即证明通了。");
         }
 
+        /// <summary>
+        /// 打印机重启后自动校准 IP。
+        /// 不靠地址，靠设备身份（UUID / 序列号）：先看原来那个地址还是不是同一台设备，
+        /// 不是就扫网按身份找回来，再改端口指向。认不出是哪台时宁可报「认不出」，绝不瞎猜。
+        /// </summary>
+        private void OnCalibrate()
+        {
+            if (_calibrating)
+            {
+                Log("上一次校准还没跑完，稍等…");
+                return;
+            }
+            _calibrating = true;
+            btnCalibrate.Enabled = false;
+            string range = txtRange.Text.Trim();
+            Log("开始自动校准：检查每台队列绑定的设备现在还在不在原来的地址上。");
+            SetStatus("正在校准 IP…");
+
+            var th = new Thread(delegate()
+            {
+                IpRebind.RebindResult r = null;
+                string err = "";
+                try
+                {
+                    r = IpRebind.Rebind(range, delegate(string m) { Ui(delegate { Log(m); }); });
+                }
+                catch (Exception ex) { err = ex.Message; }
+
+                Ui(delegate
+                {
+                    _calibrating = false;
+                    btnCalibrate.Enabled = true;
+                    if (r == null)
+                    {
+                        Log("校准失败：" + err);
+                        SetStatus("校准失败");
+                        return;
+                    }
+                    foreach (string s in r.Steps) Log("  " + s);
+                    Log(IpRebind.LastNote);
+                    int moved = r.Moved;
+                    SetStatus(moved > 0
+                        ? "已自动校准 " + moved + " 台打印机的 IP"
+                        : "校准完成：不需要改动");
+                    if (moved > 0)
+                    {
+                        ReloadPrinters(false);
+                        StartQuickProbe();
+                    }
+                });
+            });
+            th.IsBackground = true;
+            th.Start();
+        }
+
         private void OnBind()
         {
             PrinterInfo p = GetSelectedPrinter();
@@ -802,6 +908,44 @@ namespace PrinterIpFix
                     Log("警告：" + d.Ip + " 的 9100/631 都连不上，仍然写入端口配置（设备可能刚离线）。");
                 }
 
+                // ---- 第一步：先问设备到底收什么格式 ----
+                // 这一步是整件事的关键。Windows 的 Microsoft IPP Class Driver 走 RAW 端口时
+                // 会原样吐 PDF；设备若不在 document-format-supported 里声明 application/pdf，
+                // 就会静默丢弃，而 Windows 依然记「打印成功」—— 这就是「电脑说打了、机器不出纸」。
+                if (!d.FormatsProbed)
+                {
+                    try { IppPrint.ProbeFormats(d, 4000); }
+                    catch { }
+                }
+
+                // ---- 第二步：设备不收 PDF → 绝不建 RAW 端口，改走发现型端口 ----
+                if (d.FormatsProbed && !d.SupportsPdf)
+                {
+                    Log("设备 " + d.Ip + " 不接收 PDF（支持：" + d.FormatsText + "）。");
+                    Log("所以不能再用 RAW 9100 端口 —— 那条通道只会让 Windows 报成功、机器不出纸。");
+
+                    // 本机如果有指向这台设备（同 UUID）的发现型端口，直接切过去：它走真 IPP 会话，能协商格式
+                    string wsd = IpRebind.FindWsdPort(d.Uuid);
+                    if (wsd.Length > 0)
+                    {
+                        PrinterSystem.SetPrinterPort(p.Name, wsd);
+                        string got = PrinterSystem.GetPrinterPort(p.Name);
+                        if (string.Compare(got, wsd, StringComparison.OrdinalIgnoreCase) == 0)
+                        {
+                            Log("成功：" + p.Name + " 已切到发现型端口 " + wsd + "（这条通道会协商文档格式，能真出纸）。");
+                            IpRebind.Remember(p.Name, d, wsd);
+                            return true;
+                        }
+                        Log("失败：切到 " + wsd + " 后回读到 " + got + "。");
+                    }
+
+                    Log("本机没有指向这台设备（UUID " + IpRebind.NormalizeUuid(d.Uuid) + "）的发现型端口。");
+                    Log("请用系统「设置 → 蓝牙和其他设备 → 打印机和扫描仪 → 添加打印机」添加这台设备 ——");
+                    Log("Windows 会为它建立 WSD/IPP 发现型端口，那条通道才能正常出纸。");
+                    Log("（或在本工具「IPP 直发」里直接发文件，绕开 Windows 队列。）");
+                    return false;
+                }
+
                 // 复用已指向同一地址的端口，避免堆一堆相似端口
                 string reuse = "";
                 foreach (KeyValuePair<string, PortInfo> kv in PrinterSystem.GetTcpPorts())
@@ -849,6 +993,7 @@ namespace PrinterIpFix
                     return false;
                 }
                 Log("成功：" + p.Name + " 现在指向 " + usePort + "（" + d.Ip + "）。");
+                IpRebind.Remember(p.Name, d, usePort);
                 return true;
             }
             catch (Exception ex)
@@ -896,6 +1041,11 @@ namespace PrinterIpFix
             }
             try
             {
+                if (MessageBox.Show("向队列「" + p.Name + "」真打一张测试页？会消耗 1 张纸。\r\n\r\n"
+                        + "只想看排版/内容对不对，不必真打 —— 那张纸的内容只是队列名、端口和时间。",
+                        "打印测试页", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK)
+                    return;
+
                 var doc = new PrintDocument();
                 doc.DocumentName = "打印机连通性测试";
                 doc.PrinterSettings.PrinterName = p.Name;
@@ -936,6 +1086,78 @@ namespace PrinterIpFix
             }
         }
 
+        /// <summary>
+        /// IPP 直发测试页：不走 Windows 队列，直接问设备支持什么格式再按格式发。
+        /// 用于「电脑提示打印成功、打印机不出纸」这类设备不支持 PDF 的情况。
+        ///
+        /// 因为真打会耗纸，这里强制三道闸：①同一时刻只允许一次（_ippSending）；
+        /// ②先问「真打 / 只看预览」；③标题里带序号与时间，便于事后对账。
+        /// </summary>
+        private void OnIppTestPage()
+        {
+            DeviceInfo d = GetSelectedDevice();
+            if (d == null)
+            {
+                MessageBox.Show("先在右栏选中一台网络设备（要带 IPP 服务的）。", "缺少选择",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            if (_ippSending)
+            {
+                MessageBox.Show("上一张测试页还在发送，等它结束再点。", "正在发送",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            DialogResult pick = MessageBox.Show(
+                "要把测试页真打出来吗？\r\n\r\n"
+              + "· 是 = 直接发给打印机，会消耗 1 张纸\r\n"
+              + "· 否 = 只生成本地预览图并打开，不耗纸\r\n"
+              + "· 取消 = 什么都不做\r\n\r\n"
+              + "验证通道通不通，看预览图就够了；只有要确认「纸上真的有字」时才需要真打。",
+                "IPP 直发测试页", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+            if (pick == DialogResult.Cancel) return;
+
+            if (pick == DialogResult.No)
+            {
+                string path;
+                bool okPrev = IppPrint.PreviewTestPage(d, out path);
+                Log("IPP 测试页预览：" + IppPrint.LastNote);
+                if (okPrev) Log("  预览已用系统看图工具打开；确认没问题再点「是」真打一张。");
+                return;
+            }
+
+            _ippSending = true;
+            Cursor = Cursors.WaitCursor;
+            btnIppTest.Enabled = false;
+            try
+            {
+                Log("IPP 直发 → " + d.Ip + "：" + (d.FormatsProbed ? d.FormatsText : "先问设备支持哪些格式…"));
+                bool ok = IppPrint.SendTestPage(d, 8000);
+                Log("  " + IppPrint.LastNote);
+                FillDeviceList();
+                if (ok)
+                {
+                    Log("设备已受理这条作业（IPP 回了成功与 job-id）。出纸后即证明这台设备能被直发通道打印。");
+                    Log("  提示：本次只发 1 页。若只要验证通道，下次可点「否」走预览，不耗纸。");
+                }
+                else
+                {
+                    Log("直发失败。若日志是「设备不支持这种文档格式」，说明这台设备连 JPEG 也不收，只能靠厂商驱动。");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("IPP 直发异常：" + ex.GetType().Name + " " + ex.Message);
+            }
+            finally
+            {
+                _ippSending = false;
+                btnIppTest.Enabled = true;
+                Cursor = Cursors.Default;
+            }
+        }
+
         private void ShowHelp()
         {
             const string help =
@@ -955,6 +1177,16 @@ namespace PrinterIpFix
                 "左栏选中队列后点『删除队列』。队列里卡着没出的作业会一起消失，\r\n" +
                 "名字里带 [ ] 的僵尸队列也能删掉；会先弹一次确认，删前能看清有几个作业。\r\n" +
                 "驱动和端口保留，以后要恢复得重新添加打印机。\r\n\r\n" +
+                "打印测试页 / IPP 直发\r\n" +
+                "────────────\r\n" +
+                "『打印测试页』走 Windows 队列，用来验证「队列→端口→设备」整条链路。\r\n" +
+                "『IPP 直发』绕开 Windows 队列，先问设备支持哪些文档格式，再按格式把测试页\r\n" +
+                "直接交给设备（通过 IPP Print-Job 到 631 端口），用的是设备真正接受的 JPEG。\r\n" +
+                "为什么要多这一条：Windows 的 Microsoft IPP Class Driver 配在标准 TCP/IP\r\n" +
+                "端口（RAW 9100）上时，输出的是原始 PDF。设备若不支持 PDF 就会把作业静默\r\n" +
+                "丢掉，但 Windows 照样记一条「已打印 1 页」——典型症状就是「电脑提示打印\r\n" +
+                "成功、打印机不出纸」。右栏「支持格式」列显示「未探测」或没有 PDF 就要注意。\r\n" +
+                "判据：直发成功只代表设备受理（回了 job-id），出不出纸看设备面板与实际页数。\r\n\r\n" +
                 "换任何打印机都能用\r\n" +
                 "────────────\r\n" +
                 "工具里没有任何「某个型号」的写死规则，靠 IPP 报出来的身份信息匹配：\r\n" +
@@ -962,6 +1194,8 @@ namespace PrinterIpFix
                 "常见现象\r\n" +
                 "────────────\r\n" +
                 "· 修完还是不出纸：先看耗材（黑色墨盒空了也会整机拒印）。\r\n" +
+                "· Windows 说成功但不出纸：多半是设备不支持 PDF，用『IPP 直发』验证；\r\n" +
+                "  长期解决是装厂商完整驱动，而不是继续用 Microsoft IPP Class Driver。\r\n" +
                 "· 队列显示「脱机」：右键队列，取消勾选『脱机使用打印机』。\r\n" +
                 "· 设备 631 不开但 9100 开：仍可修复，只是读不到型号，匹配靠名称。\r\n" +
                 "· 长期解决：给打印机设固定 IP（或在路由器做 DHCP 保留），就再也不会漂。";
@@ -1017,8 +1251,21 @@ namespace PrinterIpFix
         }
 
         /// <summary>删一批队列。confirm=是否先弹确认框；删不掉且没有管理员权限时提供提权重试。</summary>
+        /// <remarks>
+        /// 整个删除过程放在后台线程里跑。原因：PrinterSystem.DeletePrinter 内部要走
+        /// WMI / Remove-Printer / printui.dll / prnmngr.vbs 四条路线，每条路线后面都跟一个
+        /// WaitGone(3000~4000 毫秒) 轮询，单台队列最坏要十几秒。原来的写法在主线程同步执行，
+        /// 用户点了删除之后窗口就不响应了（会以为软件卡死）。现在改成后台线程 + 逐条进度日志，
+        /// 删除期间禁用按钮，结束后回到界面线程刷新列表。
+        /// </remarks>
         private void DeleteQueues(List<string> names, bool confirm)
         {
+            if (_deleting)
+            {
+                Log("上一次删除还没结束，稍等…");
+                return;
+            }
+
             var ports = new List<string>();
             foreach (string n in names)
             {
@@ -1032,63 +1279,120 @@ namespace PrinterIpFix
                 }
             }
 
-            if (confirm)
-            {
-                string body = "";
-                foreach (string n in names)
-                {
-                    int jobs = PrinterSystem.CountJobs(n);
-                    body += "· " + n
-                        + (jobs > 0 ? "   还有 " + jobs + " 个作业没出纸" : "") + "\r\n";
-                }
-                body += "\r\n"
-                    + (names.Count == 1 ? "删掉这个队列？" : "删掉这 " + names.Count + " 个队列？")
-                    + "\r\n队列和它排着的作业一起消失；驱动和端口不动，"
-                    + "以后要恢复得重新添加打印机。";
-                if (MessageBox.Show(body, "确认删除", MessageBoxButtons.YesNo,
-                        MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
-                {
-                    Log("已取消删除。");
-                    return;
-                }
-            }
+            _deleting = true;
+            if (btnDelete != null) btnDelete.Enabled = false;
+            if (btnAddPrinter != null) btnAddPrinter.Enabled = false;
 
+            var queue = new List<string>(names);
+            var th = new Thread(delegate() { DeleteWorker(queue, ports, confirm); });
+            th.IsBackground = true;
+            th.Start();
+        }
+
+        /// <summary>后台删除线程的主体。所有界面动作都经 Ui(...) 回界面线程。</summary>
+        private void DeleteWorker(List<string> names, List<string> ports, bool confirm)
+        {
             var failed = new List<string>();
             int ok = 0;
-            Cursor = Cursors.WaitCursor;
             try
             {
-                foreach (string n in names)
+                if (confirm)
                 {
+                    var sb = new System.Text.StringBuilder();
+                    foreach (string n in names)
+                    {
+                        int jobs = 0;
+                        try { jobs = PrinterSystem.CountJobs(n); }
+                        catch { }
+                        sb.Append("· " + n
+                            + (jobs > 0 ? "   还有 " + jobs + " 个作业没出纸" : "") + "\r\n");
+                    }
+                    sb.Append("\r\n")
+                        .Append(names.Count == 1 ? "删掉这个队列？" : "删掉这 " + names.Count + " 个队列？")
+                        .Append("\r\n队列和它排着的作业一起消失；驱动和端口不动，")
+                        .Append("以后要恢复得重新添加打印机。");
+                    string body = sb.ToString();
+
+                    bool yes = false;
+                    var gate = new System.Threading.ManualResetEvent(false);
+                    Ui(delegate()
+                    {
+                        try
+                        {
+                            yes = MessageBox.Show(body, "确认删除", MessageBoxButtons.YesNo,
+                                MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) == DialogResult.Yes;
+                        }
+                        finally { gate.Set(); }
+                    });
+                    gate.WaitOne();
+                    if (!yes)
+                    {
+                        Ui(delegate() { Log("已取消删除。"); });
+                        return;
+                    }
+                }
+
+                for (int i = 0; i < names.Count; i++)
+                {
+                    string n = names[i];
+                    Ui(delegate() { SetStatus("正在删除 " + (i + 1) + "/" + names.Count.ToString() + "：" + n); });
                     string msg;
                     bool done = PrinterSystem.DeletePrinter(n, out msg);
                     if (done) ok++;
                     else failed.Add(n);
-                    Log((done ? "已删除 " : "删除失败 ") + n + " —— " + msg);
+                    var lines = new List<string>();
+                    lines.Add((done ? "已删除 " : "删除失败 ") + n + " —— " + msg);
                     if (!done)
                         foreach (string line in PrinterSystem.LastDeleteLog)
-                            Log("    " + line);
+                            lines.Add("    " + line);
+                    Ui(delegate()
+                    {
+                        foreach (string line in lines) Log(line);
+                    });
                 }
+            }
+            catch (Exception ex)
+            {
+                Ui(delegate() { Log("删除过程中出错：" + ex.Message); });
             }
             finally
             {
-                Cursor = Cursors.Default;
-                ReloadPrinters(false);
+                Ui(delegate()
+                {
+                    try
+                    {
+                        if (!IsDisposed)
+                        {
+                            ReloadPrinters(false);
+
+                            for (int i = 0; i < names.Count && i < ports.Count; i++)
+                            {
+                                if (string.IsNullOrEmpty(ports[i])) continue;
+                                if (PrinterSystem.PrintersOnPort(ports[i]).Count == 0)
+                                    Log("端口 " + ports[i] + " 已经没有队列在用了"
+                                        + "（要清端口用 PrinterQueueCleanup.exe）。");
+                            }
+
+                            Log("删除完成：" + ok + "/" + names.Count + " 成功，当前共 "
+                                + _printers.Count + " 个队列。");
+                            SetStatus("删除完成：" + ok + "/" + names.Count + " 成功");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log("刷新队列失败：" + ex.Message);
+                    }
+                    finally
+                    {
+                        if (btnDelete != null) btnDelete.Enabled = true;
+                        if (btnAddPrinter != null) btnAddPrinter.Enabled = true;
+                        _deleting = false;
+                    }
+
+                    if (failed.Count > 0 && !PrinterSystem.IsAdmin())
+                        OfferElevatedDelete(failed);
+                });
             }
-
-            for (int i = 0; i < names.Count && i < ports.Count; i++)
-            {
-                if (string.IsNullOrEmpty(ports[i])) continue;
-                if (PrinterSystem.PrintersOnPort(ports[i]).Count == 0)
-                    Log("端口 " + ports[i] + " 已经没有队列在用了"
-                        + "（要清端口用 PrinterQueueCleanup.exe）。");
-            }
-
-            Log("删除完成：" + ok + "/" + names.Count + " 成功，当前共 "
-                + _printers.Count + " 个队列。");
-
-            if (failed.Count > 0 && !PrinterSystem.IsAdmin())
-                OfferElevatedDelete(failed);
         }
 
         /// <summary>普通权限删不掉时，用管理员身份重启自己再删一遍。</summary>

@@ -100,6 +100,34 @@ namespace PrinterIpFix
         public int RttMs = -1;
         public string Error = "";
 
+        /// <summary>设备自报支持的文档格式（document-format-supported，逗号分隔）。</summary>
+        public string Formats = "";
+        /// <summary>是否真的问到了格式列表 —— 空列表也分「不知道」和「没探」。</summary>
+        public bool FormatsProbed;
+
+        /// <summary>设备是否接受 PDF。Windows 的 Microsoft IPP Class Driver 经 RAW 端口发的就是 PDF。</summary>
+        public bool SupportsPdf
+        {
+            get { return Ipp.HasFormat(Formats, "application/pdf"); }
+        }
+
+        /// <summary>是否接受 JPEG —— 直发测试页走这个格式，实测最稳。</summary>
+        public bool SupportsJpeg
+        {
+            get { return Ipp.HasFormat(Formats, "image/jpeg"); }
+        }
+
+        /// <summary>格式列的显示文本。</summary>
+        public string FormatsText
+        {
+            get
+            {
+                if (!FormatsProbed) return "未探测";
+                if (Formats.Length == 0) return "设备未上报";
+                return Formats;
+            }
+        }
+
         public string Services
         {
             get
